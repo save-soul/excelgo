@@ -1,0 +1,23 @@
+# 编译产物
+*.exe
+
+# Go 通用
+/vendor/
+
+# 测试 / 临时产物
+*.test
+out_*.xlsx
+output_*.xlsx
+_*.xlsx
+1.xlsx
+testdata_tmp/
+
+# 诊断目录
+_diag_*
+_b_in/
+_b_out/
+_v/
+_probe/
+
+# 项目内部数据（memory / 缓存，不进版本库）
+.workbuddy/
