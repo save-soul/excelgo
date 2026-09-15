@@ -24,6 +24,20 @@ import (
 //   - name:     工作表名
 //   - index:    0 基序号
 //   - sheetIdx: 在 wb.Sheets.Sheet 中的下标（与 index 相同，便于改结构体）
+// worksheetRelType 是 worksheet 关系类型常量。
+const worksheetRelType = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+
+// locateSheetInMap 在 fileMap 的工作簿结构中定位工作表，返回其信息。
+//   - file:     worksheet XML 路径（如 "xl/worksheets/sheet3.xml"）
+//   - name:     工作表名
+//   - index:    0 基序号（在 wb.Sheets.Sheet 中的下标）
+//   - sheetIdx: 同 index，便于改结构体
+//
+// 工作表文件由其 RID 经 workbook.xml.rels 唯一确定，与 <sheet> 在列表中的顺序/编号毫无关系。
+// WPS 等软件在删除、新建、重排工作表后，xl/worksheets/sheet{N}.xml 的文件名编号与列表顺序会
+// 解耦（例如第 1 个 <sheet> 实际指向 sheet3.xml）。因此本函数以 rels 解析为唯一权威依据；
+// 若 RID 无法在 rels 中解析、或解析出的文件不存在，直接报错，绝不按位置命名臆测/兜底，
+// 以确保定位结果唯一确定、不会产生错文件。
 func locateSheetInMap(fileMap map[string][]byte, wb *Workbook, sheetRef string) (file, name string, index, sheetIdx int, err error) {
 	if len(wb.Sheets.Sheet) == 0 {
 		return "", "", 0, 0, fmt.Errorf("工作簿中没有工作表")
@@ -47,23 +61,34 @@ func locateSheetInMap(fileMap map[string][]byte, wb *Workbook, sheetRef string) 
 		}
 	}
 	s := wb.Sheets.Sheet[idx]
-	file = fmt.Sprintf("xl/worksheets/sheet%d.xml", idx+1)
-	if !fileExistsInMap(fileMap, file) {
-		// 工作表文件路径不一定与序号对齐（极端情况），回退到 rels 解析
-		rels := &Relationships{}
-		if e := getXMLFromMap(fileMap, "xl/_rels/workbook.xml.rels", rels); e == nil {
-			for _, rel := range rels.Relationship {
-				if rel.ID == s.RID && rel.Type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" {
-					file = resolveTarget("xl", rel.Target)
-					break
-				}
-			}
-		}
-	}
-	if !fileExistsInMap(fileMap, file) {
-		return "", "", 0, 0, fmt.Errorf("找不到工作表 %q 对应的 worksheet 文件", s.Name)
+
+	// 唯一权威路径：通过 RID 在 workbook.xml.rels 中解析目标 worksheet 文件。
+	// 解析失败（rel s 缺失/RID 不匹配/目标文件不存在）一律直接报错，不臆测。
+	file, err = resolveWorksheetFile(fileMap, s.RID)
+	if err != nil {
+		return "", "", 0, 0, err
 	}
 	return file, s.Name, idx, idx, nil
+}
+
+// resolveWorksheetFile 依据工作表 RID 在 workbook.xml.rels 中查找其 worksheet 文件。
+// 这是确定工作表文件位置的唯一权威方式；任何基于 "第 N 个 sheet 即 sheet{N+1}.xml" 的假设
+// 在 WPS 删改过的工作簿中都不成立。找不到或目标文件缺失时返回明确错误。
+func resolveWorksheetFile(fileMap map[string][]byte, rid string) (string, error) {
+	rels := &Relationships{}
+	if err := getXMLFromMap(fileMap, "xl/_rels/workbook.xml.rels", rels); err != nil {
+		return "", fmt.Errorf("解析 workbook.xml.rels 失败：%w", err)
+	}
+	for _, rel := range rels.Relationship {
+		if rel.ID == rid && rel.Type == worksheetRelType {
+			file := resolveTarget("xl", rel.Target)
+			if !fileExistsInMap(fileMap, file) {
+				return "", fmt.Errorf("工作表关系 %q 指向的文件 %q 不存在于压缩包内", rid, file)
+			}
+			return file, nil
+		}
+	}
+	return "", fmt.Errorf("在 workbook.xml.rels 中找不到 RID=%q 的 worksheet 关系", rid)
 }
 
 // ---------- NewSheet：新建工作表 ----------
@@ -193,7 +218,10 @@ func deleteSheetInMap(fileMap map[string][]byte, sheetRef string) error {
 
 	// 1) 收集该表专属部件（worksheet 自身、其 rels、其 drawing、其独占 media）
 	//    先统计其余工作表引用了哪些 media，避免删除共享图片。
-	otherMedia := collectReferencedMediaExcept(fileMap, wb, sheetIdx)
+	otherMedia, err := collectReferencedMediaExcept(fileMap, wb, sheetIdx)
+	if err != nil {
+		return err
+	}
 
 	// 待删除的 fileMap key
 	toDelete := map[string]bool{file: true}
@@ -259,24 +287,18 @@ func loadRels(fileMap map[string][]byte, relsFile string) *Relationships {
 }
 
 // collectReferencedMediaExcept 返回除 exceptIdx 之外所有工作表引用的 media 绝对路径集合。
-func collectReferencedMediaExcept(fileMap map[string][]byte, wb *Workbook, exceptIdx int) map[string]bool {
+// 任一工作表文件无法通过其 RID 在 rels 中确定时，直接返回错误（不跳过、不臆测），
+// 以保证共享媒体判定结果唯一确定、不会因「猜不到」而误删被共享的图片。
+func collectReferencedMediaExcept(fileMap map[string][]byte, wb *Workbook, exceptIdx int) (map[string]bool, error) {
 	seen := make(map[string]bool)
 	for i, s := range wb.Sheets.Sheet {
 		if i == exceptIdx {
 			continue
 		}
-		sf := fmt.Sprintf("xl/worksheets/sheet%d.xml", i+1)
-		if !fileExistsInMap(fileMap, sf) {
-			// 回退按 rels 解析
-			rels := &Relationships{}
-			if e := getXMLFromMap(fileMap, "xl/_rels/workbook.xml.rels", rels); e == nil {
-				for _, rel := range rels.Relationship {
-					if rel.ID == s.RID && rel.Type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" {
-						sf = resolveTarget("xl", rel.Target)
-						break
-					}
-				}
-			}
+		// 通过 RID 解析该表真正的工作表文件（与列表顺序解耦，不能用 sheet{i+1}.xml 臆测）
+		sf, err := resolveWorksheetFile(fileMap, s.RID)
+		if err != nil {
+			return nil, fmt.Errorf("无法确定工作表 %q 的文件位置：%w", s.Name, err)
 		}
 		sr := loadRels(fileMap, "xl/worksheets/_rels/"+path.Base(sf)+".rels")
 		if sr == nil {
@@ -299,7 +321,7 @@ func collectReferencedMediaExcept(fileMap map[string][]byte, wb *Workbook, excep
 			}
 		}
 	}
-	return seen
+	return seen, nil
 }
 
 // addCascade 把 target 部件加入待删除集合，并级联其 rels 引用的子部件

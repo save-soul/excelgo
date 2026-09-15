@@ -154,48 +154,80 @@ func getColWidthInWS(ws string, col int) float64 {
 	return 0
 }
 
-func setRowHeightInWS(ws string, row int, height float64, custom bool) string {
-	h := strconv.FormatFloat(height, 'f', -1, 64)
-	rowTagRe := regexp.MustCompile(`(<row\b[^>]*\br="` + strconv.Itoa(row) + `"[^>]*)(/?>)`)
-	if m := rowTagRe.FindStringSubmatch(ws); m != nil {
-		tag := m[1]
-		tag = regexp.MustCompile(`\s+ht="[^"]*"`).ReplaceAllString(tag, "")
-		tag = regexp.MustCompile(`\s+customHeight="\d"`).ReplaceAllString(tag, "")
-		tag = strings.TrimRight(tag, " ") + ` ht="` + h + `" customHeight="1"`
-		closed := m[2]
-		if closed == "/>" {
-			// 自闭合行：改为带闭合标签以保留内容（内容在后续匹配中）
-			// 用正则把整行重开
-			ws = regexp.MustCompile(`<row\b[^>]*\br="`+strconv.Itoa(row)+`"[^>]*/>`).ReplaceAllString(ws, tag+`></row>`)
-		} else {
-			ws = rowTagRe.ReplaceAllString(ws, tag+`>`)
-		}
+// modifyRowTag 定位 <row r="N"> 或 <row r="N"/> 的起始标签，对标签头（不含结束符）
+// 应用 fn 改造，并正确保留「自闭合」或「带内容」两种形态。
+//
+// 关键修正：此前用 (<?/>) 捕获结束符，但 [^>]* 是贪婪的、且 / 不属于 >，
+// 会把自闭合斜杠 / 当作属性字符吞掉，导致 m[2] 误判为 ">" 而非 "/>"，
+// 进而把 hidden 等属性插到 /> 之后，生成非法 XML（如 <row ...1"/ hidden="1">）。
+// 此处改用 (?s)...(?:/>|>) 精确匹配完整结束符，并据末尾字符判定形态。
+// fn 接收去掉结束符的标签头（如 `<row r="3" ht="30" customHeight="1"`），返回改造后的标签头。
+func modifyRowTag(ws string, row int, fn func(head string) string) string {
+	rowRe := regexp.MustCompile(`(?s)<row\b[^>]*?\br="` + strconv.Itoa(row) + `"[^>]*?(?:/>|>)`)
+	idx := rowRe.FindStringIndex(ws)
+	if idx == nil {
 		return ws
 	}
-	// 行不存在：插入带高度的空行
-	newRow := `<row r="` + strconv.Itoa(row) + `" ht="` + h + `" customHeight="1"/>`
-	return insertRowElement(ws, row, newRow)
+	start, end := idx[0], idx[1]
+	openTag := ws[start:end]
+	if strings.HasSuffix(openTag, "/>") {
+		// 自闭合空行：改写标签头后仍以 /> 收尾
+		head := strings.TrimSuffix(openTag, "/")
+		head = fn(head)
+		return ws[:start] + head + `/>` + ws[end:]
+	}
+	// 带内容的行：定位配对的 </row>
+	closeIdx := strings.Index(ws[end:], "</row>")
+	if closeIdx == -1 {
+		// 异常：无闭合标签，仅在起始标签内追加属性
+		head := strings.TrimSuffix(openTag, ">")
+		head = fn(head)
+		return ws[:start] + head + `>` + ws[end:]
+	}
+	closeStart := end + closeIdx
+	content := ws[end:closeStart]
+	head := strings.TrimSuffix(openTag, ">")
+	head = fn(head)
+	return ws[:start] + head + `>` + content + `</row>` + ws[closeStart+len("</row>"):]
+}
+
+// rowExists 判断工作表中是否已存在指定行号的元素。
+func rowExists(ws string, row int) bool {
+	rowRe := regexp.MustCompile(`(?s)<row\b[^>]*?\br="` + strconv.Itoa(row) + `"[^>]*?(?:/>|>)`)
+	return rowRe.MatchString(ws)
+}
+
+func setRowHeightInWS(ws string, row int, height float64, custom bool) string {
+	h := strconv.FormatFloat(height, 'f', -1, 64)
+	if !rowExists(ws, row) {
+		// 行不存在：插入带高度的空行
+		newRow := `<row r="` + strconv.Itoa(row) + `" ht="` + h + `" customHeight="1"/>`
+		return insertRowElement(ws, row, newRow)
+	}
+	return modifyRowTag(ws, row, func(head string) string {
+		head = regexp.MustCompile(`\s+ht="[^"]*"`).ReplaceAllString(head, "")
+		head = regexp.MustCompile(`\s+customHeight="\d"`).ReplaceAllString(head, "")
+		head = strings.TrimRight(head, " ") + ` ht="` + h + `" customHeight="1"`
+		return head
+	})
 }
 
 func setRowHiddenInWS(ws string, row int, hidden bool) string {
-	rowTagRe := regexp.MustCompile(`(<row\b[^>]*\br="` + strconv.Itoa(row) + `"[^>]*)(/?>)`)
 	hv := ""
 	if hidden {
 		hv = ` hidden="1"`
 	}
-	if m := rowTagRe.FindStringSubmatch(ws); m != nil {
-		tag := m[1]
-		tag = regexp.MustCompile(`\s+hidden="\d"`).ReplaceAllString(tag, "")
-		tag = strings.TrimRight(tag, " ") + hv
-		if m[2] == "/>" {
-			ws = regexp.MustCompile(`<row\b[^>]*\br="`+strconv.Itoa(row)+`"[^>]*/>`).ReplaceAllString(ws, tag+`></row>`)
-		} else {
-			ws = rowTagRe.ReplaceAllString(ws, tag+`>`)
-		}
-		return ws
+	if !rowExists(ws, row) {
+		newRow := `<row r="` + strconv.Itoa(row) + `"` + hv + `/>`
+		return insertRowElement(ws, row, newRow)
 	}
-	newRow := `<row r="` + strconv.Itoa(row) + `"` + hv + `/>`
-	return insertRowElement(ws, row, newRow)
+	return modifyRowTag(ws, row, func(head string) string {
+		head = regexp.MustCompile(`\s+hidden="\d"`).ReplaceAllString(head, "")
+		if hidden {
+			head = strings.TrimRight(head, " ") + hv
+		}
+		return head
+	})
 }
 
 func setColHiddenInWS(ws string, col int, hidden bool) string {
@@ -203,19 +235,18 @@ func setColHiddenInWS(ws string, col int, hidden bool) string {
 	re := regexp.MustCompile(`(?s)<cols\b[^>]*>(.*?)</cols>`)
 	if m := re.FindStringSubmatch(ws); m != nil {
 		inner := m[1]
-		colRe := regexp.MustCompile(`(<col\b[^>]*\bmin="` + strconv.Itoa(col) + `"[^>]*\bmax="` + strconv.Itoa(col) + `"[^>]*)(/?>)`)
+		// 匹配 <col .../> 或 <col ...>（列元素无内容，统一重建为自闭合标签，
+		// 确保 hidden 属性落在标签内部、绝不出现在自闭合 /> 之后导致 XML 非法）。
+		colRe := regexp.MustCompile(`<col\b[^>]*\bmin="` + strconv.Itoa(col) + `"[^>]*\bmax="` + strconv.Itoa(col) + `"[^>]*/?>`)
 		newInner := colRe.ReplaceAllStringFunc(inner, func(c string) string {
-			sm := colRe.FindStringSubmatch(c)
-			if sm == nil {
-				return c
-			}
-			tag := sm[1]
-			tag = regexp.MustCompile(`\s+hidden="\d"`).ReplaceAllString(tag, "")
+			// 去掉已有 hidden 属性，并裁掉结尾的 /> 或 >，统一重建成自闭合标签
+			c = regexp.MustCompile(`\s+hidden="\d"`).ReplaceAllString(c, "")
+			c = strings.TrimRight(c, " />")
 			if hidden {
-				tag = strings.TrimRight(tag, " ") + ` hidden="1"`
+				c = c + ` hidden="1"`
 			}
 			updated = true
-			return tag + `>`
+			return c + `/>`
 		})
 		if updated {
 			return re.ReplaceAllString(ws, `<cols>`+newInner+`</cols>`)
@@ -744,27 +775,16 @@ func (s *WorkSheet) GroupCols(c1, c2, level int) error {
 }
 
 func groupRowsInWS(ws string, r1, r2, level int) string {
-	re := regexp.MustCompile(`(?s)<row\b[^>]*\br="(\d+)"[^>]*?(?:/>|>(.*?)</row>)`)
-	return re.ReplaceAllStringFunc(ws, func(m string) string {
-		sm := regexp.MustCompile(`\br="(\d+)"`).FindStringSubmatch(m)
-		if sm == nil {
-			return m
-		}
-		row, _ := strconv.Atoi(sm[1])
-		if row < r1 || row > r2 {
-			return m
-		}
-		// 改写起始 <row ...> 标签
-		openRe := regexp.MustCompile(`(<row\b[^>]*?)(/?>)`)
-		om := openRe.FindStringSubmatch(m)
-		if om == nil {
-			return m
-		}
-		tag := om[1]
-		tag = regexp.MustCompile(`\s+outlineLevel="\d"`).ReplaceAllString(tag, "")
-		tag = strings.TrimRight(tag, " ") + fmt.Sprintf(` outlineLevel="%d"`, level)
-		return strings.Replace(m, om[0], tag+`>`, 1)
-	})
+	// 逐行定位并改写起始标签，复用 modifyRowTag 保证自闭合/带内容两种形态都正确，
+	// 规避 (<?/>) 捕获把 / 误吞导致 m[2] 误判的同类缺陷。
+	for row := r1; row <= r2; row++ {
+		ws = modifyRowTag(ws, row, func(head string) string {
+			head = regexp.MustCompile(`\s+outlineLevel="\d"`).ReplaceAllString(head, "")
+			head = strings.TrimRight(head, " ") + fmt.Sprintf(` outlineLevel="%d"`, level)
+			return head
+		})
+	}
+	return ws
 }
 
 func setColWidthInWSGroup(ws string, min, max, level int) string {

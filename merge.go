@@ -269,24 +269,11 @@ func locateSheet(srcMap map[string][]byte, srcWB *Workbook, sheetRef string) (st
 			return "", "", -1, fmt.Errorf("找不到工作表 %q", sheetRef)
 		}
 	}
-	file := fmt.Sprintf("xl/worksheets/sheet%d.xml", idx+1)
-	if !fileExistsInMap(srcMap, file) {
-		rels := &Relationships{}
-		if err := getXMLFromMap(srcMap, "xl/_rels/workbook.xml.rels", rels); err != nil {
-			return "", "", -1, err
-		}
-		for _, rel := range rels.Relationship {
-			if rel.ID == srcWB.Sheets.Sheet[idx].RID &&
-				rel.Type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" {
-				file = resolveTarget("xl", rel.Target)
-				break
-			}
-		}
+	f, ferr := resolveWorksheetFile(srcMap, srcWB.Sheets.Sheet[idx].RID)
+	if ferr != nil {
+		return "", "", -1, ferr
 	}
-	if !fileExistsInMap(srcMap, file) {
-		return "", "", -1, fmt.Errorf("找不到源工作表文件")
-	}
-	return file, name, idx, nil
+	return f, name, idx, nil
 }
 
 // nextFreeNumber 在 fileMap 中查找前缀 prefix+数字+suffix 形式里未占用的最小正整数编号。

@@ -115,22 +115,11 @@ func CopySheet(src, dst, sheetRef string, opts ...Option) error {
 		}
 	}
 
-	// 获取源工作表文件路径
-	srcSheetFile := fmt.Sprintf("xl/worksheets/sheet%d.xml", srcIndex+1)
-	if !fileExistsInMap(fileMap, srcSheetFile) {
-		rels := &Relationships{}
-		if err := getXMLFromMap(fileMap, "xl/_rels/workbook.xml.rels", rels); err != nil {
-			return err
-		}
-		for _, rel := range rels.Relationship {
-			if rel.ID == srcSheet.RID && rel.Type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" {
-				srcSheetFile = resolveTarget("xl", rel.Target)
-				break
-			}
-		}
-		if srcSheetFile == "" {
-			return fmt.Errorf("无法找到源工作表文件")
-		}
+	// 获取源工作表文件路径：以 RID→rels 解析为唯一权威依据（WPS 删改后文件名与顺序解耦）。
+	// 解析失败（rel s 缺失/RID 不匹配/目标文件不存在）直接报错，不按位置命名臆测/兜底。
+	srcSheetFile, rerr := resolveWorksheetFile(fileMap, srcSheet.RID)
+	if rerr != nil {
+		return rerr
 	}
 
 	// 复制工作表

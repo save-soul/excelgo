@@ -301,7 +301,8 @@ func (s *WorkSheet) GetCellFormula(ref string) string {
 	if strings.Contains(m[0], "<f") {
 		fm := regexp.MustCompile(`(?s)<f[^>]*>(.*?)</f>`).FindStringSubmatch(m[1])
 		if fm != nil {
-			return strings.TrimPrefix(fm[1], "=")
+			// 公式在 XML 中以转义形式存储（如 &amp;），读出时需还原
+			return unescapeXML(strings.TrimPrefix(fm[1], "="))
 		}
 	}
 	return ""

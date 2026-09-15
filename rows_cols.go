@@ -210,9 +210,12 @@ func shiftCellRowRefs(ws string, pivot, delta int, delRows *[2]int) string {
 	})
 }
 
-// deleteRowRange 删除 [row, row+n-1] 的所有 <row ...>...</row> 块（含内容）。
+// deleteRowRange 删除 [row, row+n-1] 的所有 <row> 块（含内容）。
+// 必须同时兼容自闭合 <row r="2"/> 与带内容的 <row r="3">...</row>，
+// 否则在存在空行（InsertRows 产生的自闭合 <row/>）时，正则的 .*? 会越过 /> 边界
+// 把下一行一并吞入同一匹配，导致误删多行、数据丢失。
 func deleteRowRange(ws string, row, n int) string {
-	re := regexp.MustCompile(`(?s)<row\b[^>]*\br="(\d+)"[^>]*>.*?</row>`)
+	re := regexp.MustCompile(`(?s)<row\b[^>]*\br="(\d+)"[^>]*?(?:/>|>(.*?)</row>)`)
 	return re.ReplaceAllStringFunc(ws, func(m string) string {
 		sub := re.FindStringSubmatch(m)
 		r, _ := strconv.Atoi(sub[1])
