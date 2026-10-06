@@ -22,5 +22,10 @@ _probe/
 # 项目内部数据（memory / 缓存，不进版本库）
 .workbuddy/
 
+# difftest/ 下的 .xlsx 全部是 openpyxl 探针脚本的产物（base.xlsx / prn.xlsx /
+# charts.xlsx / probe_combos*.xlsx 等），由 difftest/*.py 按默认参数就地生成。
+# Go 测试一律显式传 t.TempDir() 路径，从不读取这些文件，故不入库。
+difftest/*.xlsx
+
 # 组合场景探针的产物（difftest/probe_combos.py 生成，测试内会搬走）
 probe_combo*.xlsx

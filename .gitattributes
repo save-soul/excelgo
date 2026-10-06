@@ -1,0 +1,24 @@
+# 统一换行策略：仓库内一律 LF，检出到工作区也保持 LF。
+# 用属性文件显式声明，优先级高于 core.autocrlf，避免 Git 弹出
+# "LF will be replaced by CRLF" 这类警告，也避免行尾来回抖动。
+* text=auto eol=lf
+
+# 二进制制品：禁止任何行尾/文本转换
+*.xlsx binary
+*.xlsm binary
+*.xls  binary
+*.docx binary
+*.pptx binary
+*.pdf  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.exe  binary
+*.bin  binary
+
+# Windows 批处理与 PowerShell 脚本按平台习惯保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
