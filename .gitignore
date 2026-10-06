@@ -21,3 +21,6 @@ _probe/
 
 # 项目内部数据（memory / 缓存，不进版本库）
 .workbuddy/
+
+# 组合场景探针的产物（difftest/probe_combos.py 生成，测试内会搬走）
+probe_combo*.xlsx

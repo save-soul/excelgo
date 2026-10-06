@@ -144,7 +144,7 @@ func cellDisplayValue(cellInner string, fileMap map[string][]byte) string {
 	switch tAttr {
 	case "s":
 		// 共享字符串索引
-		if v := firstTag(cellInner, "v"); v != "" {
+		if v := firstTag(cellInner, tagName("v")); v != "" {
 			if idx, err := strconv.Atoi(v); err == nil {
 				return sharedStringAt(fileMap, idx)
 			}
@@ -158,27 +158,27 @@ func cellDisplayValue(cellInner string, fileMap map[string][]byte) string {
 		}
 		return ""
 	case "b":
-		if v := firstTag(cellInner, "v"); v == "1" {
+		if v := firstTag(cellInner, tagName("v")); v == "1" {
 			return "TRUE"
 		}
 		return "FALSE"
 	case "str":
 		// 公式字符串结果
-		if v := firstTag(cellInner, "v"); v != "" {
+		if v := firstTag(cellInner, tagName("v")); v != "" {
 			return v
 		}
 		// 退化：无 v 返回公式文本
-		if f := firstTag(cellInner, "f"); f != "" {
+		if f := firstTag(cellInner, tagName("f")); f != "" {
 			return "=" + f
 		}
 		return ""
 	default:
 		// 数值或公式结果
-		if v := firstTag(cellInner, "v"); v != "" {
+		if v := firstTag(cellInner, tagName("v")); v != "" {
 			return v
 		}
 		// 有 <f> 但无缓存结果（如 <v /> 自闭合）：返回公式文本
-		if f := firstTag(cellInner, "f"); f != "" {
+		if f := firstTag(cellInner, tagName("f")); f != "" {
 			return "=" + f
 		}
 		return ""
@@ -199,8 +199,9 @@ func sharedStringAt(fileMap map[string][]byte, idx int) string {
 }
 
 // firstTag 提取第一个 <tag>...</tag> 的文本内容（若标签自闭合返回 ""）。
-func firstTag(s, tag string) string {
-	re := regexp.MustCompile(`(?s)<` + tag + `\b[^>]*>(.*?)</` + tag + `>`)
+func firstTag(s string, tag xmlTagName) string {
+	t := string(tag)
+	re := regexp.MustCompile(`(?s)<` + regexp.QuoteMeta(t) + `\b[^>]*>(.*?)</` + regexp.QuoteMeta(t) + `>`)
 	if m := re.FindStringSubmatch(s); m != nil {
 		return strings.TrimSpace(m[1])
 	}

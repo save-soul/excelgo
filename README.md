@@ -63,24 +63,30 @@ import (
 )
 
 func main() {
-	// Default: shared media (smaller file)
-	err := excelgo.CopySheet("input.xlsx", "output.xlsx", "Sheet1")
+	// Open a workbook (returns *excelgo.Book, alias *excelgo.File)
+	f, err := excelgo.Open("./input.xlsx")
 	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Copy a worksheet out to another file (cross-workbook); shared media by default
+	if err := f.CopySheetTo("output.xlsx", "Sheet1", ""); err != nil {
 		log.Fatal(err)
 	}
 
 	// Independent media: the copy owns its own picture files, editable/deletable
 	// independently without affecting the original sheet
-	err = excelgo.CopySheet("input.xlsx", "output2.xlsx", "Sheet1",
-		excelgo.WithMedia(excelgo.MediaIndependent))
-	if err != nil {
+	if err := f.CopySheetTo("output2.xlsx", "Sheet1", "",
+		excelgo.WithMedia(excelgo.MediaIndependent)); err != nil {
 		log.Fatal(err)
 	}
 
-	// You can also use a 1-based worksheet index and a custom suffix
-	err = excelgo.CopySheet("input.xlsx", "output3.xlsx", "1",
-		excelgo.WithSuffix("_copy"))
-	if err != nil {
+	// You can also copy within the same workbook using a 1-based worksheet index
+	// and a custom suffix; then persist with Save/SaveAs
+	if _, err := f.CopySheet("1", "", excelgo.WithSuffix("_copy")); err != nil {
+		log.Fatal(err)
+	}
+	if err := f.Save(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -94,6 +100,62 @@ func main() {
 | Independent media | `excelgo.MediaIndependent` | Copy owns its own picture files; references and relationships are rewritten | Copy needs to be edited/deleted independently, decoupled from the original |
 
 The default strategy is `MediaShared`.
+
+### Object-oriented API (excelize-style)
+
+`Open` / `Create` return a `*Book` (alias `*File`) handle, and modifications are buffered in
+memory until you call `Save` / `SaveAs` — the same flow as excelize. Worksheet copy
+(`CopySheet` / `CopySheetTo`) and cross-workbook merge (`Merge` / `MergeWorkbook`) are
+provided **both** as methods on `*Book` **and** as equivalent package-level convenience
+functions (`CopySheet` / `MergeWorkbook`): pick the package-level form for a one-shot
+open→operate→save on a single file, or the object form when you want to perform several
+operations on the same workbook and save once.
+
+```go
+package main
+
+import (
+	"log"
+
+	"github.com/save-soul/excelgo"
+)
+
+func main() {
+	// Open a workbook (returns *excelgo.Book, alias *excelgo.File)
+	f, err := excelgo.Open("./钢筋.xlsx")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Copy a worksheet within the same workbook (excelize-style); returns the new name
+	newName, err := f.CopySheet("Sheet1", "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	_ = newName
+
+	// Copy a worksheet out to another file (cross-workbook)
+	if err := f.CopySheetTo("output.xlsx", "Sheet1", "", excelgo.WithMedia(excelgo.MediaIndependent)); err != nil {
+		log.Fatal(err)
+	}
+
+	// Merge worksheets from other workbooks into this one
+	if err := f.Merge([]excelgo.SourceRef{
+		{Workbook: "jan.xlsx", Sheet: "数据A"},
+		{Workbook: "feb.xlsx", Sheet: "数据B"},
+	}); err != nil {
+		log.Fatal(err)
+	}
+
+	// Persist all in-memory changes (or use f.SaveAs("new.xlsx") for a new file)
+	if err := f.Save(); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+Because changes are buffered in memory, a single `f` can be edited many times
+(copy / merge / read / write cells) before a single `Save`.
 
 ## Command-line tool
 
@@ -114,6 +176,12 @@ excelgo copy --independent input.xlsx output.xlsx Sheet1
 # Custom suffix
 excelgo copy --suffix _copy input.xlsx output.xlsx Sheet1
 
+# Set the copied sheet name explicitly (--name)
+excelgo copy input.xlsx output.xlsx Sheet1 --name Summary
+
+# Flags may appear before or after positional args — both are equivalent
+excelgo copy --name Summary input.xlsx output.xlsx Sheet1
+
 # —— merge: cross-workbook merge ——
 # Move "数据A" from src1 and "数据B" from src2 into target
 # (target must already exist, as the container)
@@ -129,15 +197,54 @@ excelgo merge target.xlsx "src1.xlsx:Sheet1" --suffix _merged
 ## API
 
 ```go
-func CopySheet(src, dst, sheetRef string, opts ...Option) error
+// Package-level convenience (one-shot open → copy → save, for single-file ops):
+func CopySheet(src, dst, sheetRef, newName string, opts ...Option) error
+
+// Object-oriented API (recommended; several ops then one Save):
+func (b *Book) CopySheet(sheetRef, newName string, opts ...Option) (string, error)    // copy within the same workbook
+func (b *Book) CopySheetTo(dstFile, sheetRef, newName string, opts ...Option) error   // copy out to another file
 ```
 
-- `src` — source `.xlsx` path
-- `dst` — output `.xlsx` path (overwritten)
 - `sheetRef` — worksheet name (e.g. `"Sheet1"`) or 1-based numeric index (e.g. `"1"`)
+- `newName` — name of the copied worksheet. **Pass `""` to use "`<source name>` + `WithSuffix` suffix"**
+  (default `_copy`); pass a non-empty string to use it verbatim. Name clashes get a `_1`/`_2` suffix.
+- `dstFile` — (`CopySheetTo` only) output `.xlsx` path; empty or same as the current
+  file → modify in memory / overwrite the source instead of writing a separate file
 - `opts` — optional configuration:
   - `WithMedia(excelgo.MediaStrategy)` — set the media strategy
-  - `WithSuffix(string)` — set the new worksheet name suffix (default `"_copy"`)
+  - `WithSuffix(string)` — set the new worksheet name suffix (default `"_copy"`, only used when `newName` is empty)
+
+```go
+// Most common: name the copied sheet explicitly
+excelgo.CopySheet("src.xlsx", "dst.xlsx", "Sheet1", "Summary")
+
+// Don't care about the name → default suffix Sheet1_copy
+excelgo.CopySheet("src.xlsx", "dst.xlsx", "Sheet1", "")
+```
+
+> **Cross-file semantics**: both `CopySheet(src, dst, ...)` and
+> `(*Book).CopySheetTo(dst, ...)` move **only the requested worksheet(s)** into the
+> target file — other worksheets of the source workbook are never included, all
+> worksheets already in the target are preserved, and the source workbook is left
+> untouched. This is *not* a whole-workbook merge, and the target file is never
+> overwritten. Parts are relocated directly between two in-memory maps, with no
+> temporary file involved.
+>
+> To keep formatting/pictures/print areas correct after the move, cross-workbook
+> adaptation is applied: `styles.xml` is merged and `s` indexes remapped, shared
+> strings are inlined, related parts (drawing / media / comments / charts) are
+> relocated with `rId` remapping, and the print area is copied with its sheet name
+> rewritten.
+>
+> If the target file does not exist, a minimal empty workbook is created first; if it
+> does exist, the sheet is appended to it. If the target **exists but cannot be parsed**
+> (corrupt / encrypted / not an xlsx / wrong path), an error is returned and the
+> original file is **left untouched** — it is never silently replaced by an empty
+> workbook. The new sheet is named
+> "`<source name>` + `WithSuffix`" (default `_copy"); pass the 4th positional argument
+> `newName` to set it directly (`excelgo.CopySheet(src, dst, "Sheet1", "Summary")`),
+> or use `WithSuffix` to customize the suffix. Name clashes get a numeric
+> suffix appended.
 
 ### Merge worksheets (cross-workbook)
 
@@ -146,10 +253,15 @@ workbook as **independent worksheets** (the merged sheets remain independent of 
 other afterward). Good for consolidating worksheets scattered across multiple files.
 
 ```go
+// Package-level convenience (one-shot open → merge → save; dst is the container, must exist):
 func MergeWorkbook(dst string, sources []SourceRef, opts ...MergeOption) error
+
+// Object-oriented API (recommended; several ops then one Save):
+func (b *Book) Merge(sources []SourceRef, opts ...MergeOption) error            // merge into this workbook
 ```
 
-- `dst` — target workbook path (**must already exist**, used as the merge container, overwritten)
+- The merge container is the workbook `f` you already opened with `Open` (no separate
+  target path is passed); `sources` specifies which sheets to pull in from other files.
 - `sources` — list of source worksheets, each with `Workbook` (source file path) and
   `Sheet` (worksheet name or 1-based index)
 - `opts` — optional configuration:
@@ -170,11 +282,23 @@ Properties & guarantees:
   sheet name auto-remapped), page breaks (`rowBreaks/colBreaks`), page layout, etc. follow
   the worksheet.
 
+> Print titles (`_xlnm.Print_Titles`, i.e. rows/columns repeated on every printed page) are
+> carried over to the new sheet as well, with `localSheetId` and the sheet name remapped.
+
 ```go
-err := excelgo.MergeWorkbook("summary.xlsx", []excelgo.SourceRef{
+f, err := excelgo.Open("summary.xlsx")
+if err != nil {
+    log.Fatal(err)
+}
+if err := f.Merge([]excelgo.SourceRef{
     {Workbook: "jan.xlsx", Sheet: "Sheet1"},
     {Workbook: "feb.xlsx", Sheet: "data"},
-})
+}); err != nil {
+    log.Fatal(err)
+}
+if err := f.Save(); err != nil {
+    log.Fatal(err)
+}
 ```
 
 ### Worksheet lifecycle (in-place editing)
@@ -194,9 +318,15 @@ _ = excelgo.DeleteSheet("wb.xlsx", "2")
 // Move a worksheet to a position (toIndex is 1-based; 1 = front)
 _ = excelgo.MoveSheet("wb.xlsx", "Sheet2", 1)
 
-// Rename (auto-suffixes on duplicate name)
+// Rename (appends a numeric suffix on name clash, e.g. new_1)
 _ = excelgo.RenameSheet("wb.xlsx", "old", "new")
 ```
+
+> **Sheet name rules (following Excel)**: when creating, renaming or copying, the name may be
+> at most **31 characters** and must not contain `\ / ? * [ ] :` (validated by `AddSheet` /
+> `NewSheet` / `RenameSheet` / `CopySheet`). Names **may** contain XML-significant characters
+> such as `& < > "` — they are escaped automatically when written into `workbook.xml`, and
+> copy / merge / rename all handle them correctly.
 
 ### Cell read/write (multiple formats)
 
@@ -280,6 +410,15 @@ _ = excelgo.InsertCols("wb.xlsx", "Sheet1", 2, 1)
 _ = excelgo.RemoveCols("wb.xlsx", "Sheet1", 2, 1)
 ```
 
+> **Bounds checking**: the insert position may equal `lastRow + 1` (appending past the last
+> row, matching Excel's behaviour); anything beyond that returns an error, as does a delete
+> range extending past the last row. This avoids silently filling the file with meaningless
+> empty rows/columns when a large number is passed by mistake. E.g.
+> `InsertRows(wb, "Sheet1", 9999, 1)` returns
+> `插入行 9999 超出表尾（当前最大行 N，最多可在 N+1 处插入）`.
+> The last row/column is derived from actual content (`<row r>`, `<c r>`, `<col min/max>`,
+> `<row spans>`); package-level functions and `(*WorkSheet)` methods behave identically.
+
 ### Range read/write (by rectangular block)
 
 Read or write a rectangular region (e.g. `"A1:C10"`) as a whole, reusing a single
@@ -354,7 +493,14 @@ Option structs:
 > - R1C1 references are not supported (left as-is when detected); cross-sheet and
 >   space-containing sheet names (`'My Sheet'!A1`) are correctly recognized.
 >
-> Floating picture anchors do **not** shift with row/column operations, to preserve the drawing.
+> Floating picture anchors (`oneCellAnchor` / `twoCellAnchor`) shift with row/column
+> operations, matching Excel's own behaviour:
+> - On insert, pictures anchored at that position **or after it** shift by the same
+>   row/column delta; `colOff`/`rowOff` pixel offsets are preserved.
+> - On delete, anchors likewise move up; if a picture's `from` anchor falls inside the
+>   deleted band, that picture is removed along with the content.
+> - Both the `xdr:`-prefixed form (Excel/WPS) and the default-namespace form (written by
+>   this library) are handled.
 
 ### Object-oriented API (file → sheet → cell)
 
@@ -608,6 +754,42 @@ Parameters & notes:
 > (comments / table / dxfs differential format, etc.) all complete their Content_Types and
 > relationship entries.
 
+### Workbook protection & defined names
+
+```go
+// ---- Workbook structure protection (lock sheet add/delete/reorder) ----
+_ = excelgo.ProtectWorkbook("wb.xlsx", "")            // no password
+_ = excelgo.ProtectWorkbook("wb.xlsx", "secret")      // with password (Excel verifier hash)
+_ = excelgo.UnprotectWorkbook("wb.xlsx")
+wp, _ := excelgo.GetWorkbookProtection("wb.xlsx")      // wp.LockStructure / wp.PasswordHash ...
+
+// ---- Workbook-level defined (named) ranges ----
+_ = excelgo.SetDefinedName("wb.xlsx", "MyRange", "Sheet1!$A$1:$D$10")
+v, _ := excelgo.GetDefinedName("wb.xlsx", "MyRange")   // "Sheet1!$A$1:$D$10"
+_ = excelgo.DeleteDefinedName("wb.xlsx", "MyRange")
+```
+
+The object API mirrors the same (see `Book.ProtectWorkbook` / `Book.UnprotectWorkbook` /
+`Book.GetWorkbookProtection` / `Book.SetDefinedName` / `Book.GetDefinedName` /
+`Book.DeleteDefinedName`).
+
+Parameters & notes:
+
+- **ProtectWorkbook**: writes `<workbookProtection lockStructure="1">` into
+  `xl/workbook.xml` (workbook structure protection only — distinct from `ProtectSheet`,
+  which protects a single worksheet). With a non-empty `password`, the password is stored as
+  Excel's standard 16-bit password-verifier hash (4 uppercase hex chars) in the
+  `workbookPassword` attribute. `UnprotectWorkbook` removes the element.
+- **GetWorkbookProtection**: returns the current state; `LockStructure` etc. are `false` and
+  `PasswordHash` is `""` when the workbook is unprotected.
+- **SetDefinedName / GetDefinedName / DeleteDefinedName**: manage *workbook-global* named
+  ranges (no `localSheetId`), stored under `<definedNames>` in `xl/workbook.xml`. The reference
+  string is stored verbatim (e.g. `Sheet1!$A$1:$D$10`); sheet-scoped names such as the print
+  area (`_xlnm.Print_Area`) are handled separately by the page-setup API and are written with
+  a `localSheetId`.
+- All of the above pass the openpyxl strict-load cross-check (workbook protection is read back
+  as `wb.security.lock_structure`; a print area round-trips as `ws.print_area`).
+
 ## Command-line tool
 
 `cmd/excelgo` exposes all the capabilities above (worksheet lifecycle, cell read/write,
@@ -650,7 +832,7 @@ excelgo grouprows <file.xlsx> <sheet> <startRow> <endRow> <level>
 excelgo groupcols <file.xlsx> <sheet> <startCol> <endCol> <level>
 excelgo replace <file.xlsx> <sheet> <oldText> <newText>
 excelgo docprops <file.xlsx> [--title T] [--author A] [--subject S] [--keywords K]
-excelgo copy  <input.xlsx> <output.xlsx> <sheet> [--independent] [--suffix suffix]
+excelgo copy  <input.xlsx> <output.xlsx> <sheet> [--name newname] [--independent] [--suffix suffix]
 excelgo merge <target.xlsx> <src.xlsx>:<sheet> [src.xlsx>:<sheet> ...] [--suffix conflictSuffix]
 ```
 
@@ -666,7 +848,7 @@ excelgo merge <target.xlsx> <src.xlsx>:<sheet> [src.xlsx>:<sheet> ...] [--suffix
 | `newsheet` | `NewSheet` | create worksheet |
 | `delsheet` | `DeleteSheet` | delete worksheet (cleans dependent parts) |
 | `movesheet` | `MoveSheet` | reorder worksheet |
-| `renamesheet` | `RenameSheet` | rename (auto-suffix on conflict) |
+| `renamesheet` | `RenameSheet` | rename (auto numeric suffix on conflict) |
 | `getcell` | `GetCell` | read cell |
 | `setcell` | `SetCellValue` / `SetCellStr` / `SetCellInt` / `SetCellNumeric` / `SetCellBool` / `SetCellFormula` | write by `--type` |
 | `addpic` | `AddPicture` | floating picture (supports `--cell/--col-off/--row-off/--scale`) |
@@ -693,8 +875,8 @@ excelgo merge <target.xlsx> <src.xlsx>:<sheet> [src.xlsx>:<sheet> ...] [--suffix
 | `grouprows` / `groupcols` | `GroupRows` / `GroupCols` | row/column outline grouping |
 | `replace` | `ReplaceText` | find-and-replace (returns count) |
 | `docprops` | `SetDocProps` | document core properties |
-| `copy` | `CopySheet` | worksheet copy |
-| `merge` | `MergeWorkbook` | cross-workbook merge |
+| `copy` | `CopySheet` / `(*Book).CopySheetTo` | worksheet copy (package / object) |
+| `merge` | `MergeWorkbook` / `(*Book).Merge` | cross-workbook merge (package / object) |
 
 > The object API (`Open` → `Book.Sheet` → `WorkSheet.Cell/Range`) behaves exactly like the
 > global functions above; you can accumulate edits in memory and flush once with
@@ -728,6 +910,213 @@ reference shifting, copy/merge, style dedup, merge cells / column width / freeze
 / filter, data validation / conditional format / table / comment / sheet properties,
 protection / grouping / replace / document properties, and more.
 
+### Differential testing (openpyxl as an external oracle)
+
+Unit tests have a structural blind spot: they verify that *this library's output matches this
+library's expectations*. If the expectation itself is wrong, nothing catches it.
+
+`difftest/` uses openpyxl (an independent implementation, widely validated in the Excel
+ecosystem) as an external oracle: the same set of documents, the same set of operations,
+executed by both sides, then normalized into **semantic snapshots** and compared field by
+field. It catches two classes of problem existing tests miss:
+
+- this library produces things other tools can't read, or read differently (real bugs)
+- this library can't read openpyxl's normal output (compatibility gaps)
+
+| File | Role |
+| --- | --- |
+| `difftest/snapshot.py` | normalizes an xlsx into comparable JSON (semantic layer, not XML bytes) |
+| `difftest/op.py` | executes the same operations via openpyxl from JSON instructions |
+| `difftest_test.go` | harness: drives both sides, compares, exempts by field path |
+| `difftest_write_test.go` | 34 write-side scenarios (values/formulas/styles/rows+cols/layout/sheets) |
+| `difftest_read_test.go` | 12 read-side scenarios (openpyxl writes → excelgo reads) + round-trip |
+| `difftest_composite_test.go` | Composite ops: `CopySheet` / `CopySheetTo` / `MergeWorkbook` fidelity |
+| `difftest_picture_test.go` | Pictures: WPS inline pictures, floating pictures, media strategies, `ExtractPicture` |
+| `difftest_style_test.go` | Style enum details: underline / border style / alignment / number formats + rejection of invalid values |
+| `difftest_chart_test.go` | Charts: transport and closure of the **multi-level chain** (sheet→drawing→chart) |
+| `difftest_protect_test.go` | Sheet/workbook protection: hash compatibility with Excel, retention after copy/merge |
+| `difftest_combo_test.go` | **Feature combinations (transporting existing files)**: 6 openpyxl-generated combos × 3 operations |
+| `difftest_selfcombo_test.go` | **Feature combinations (excelgo-authored)**: chart creation + named style + table + array formula + conditional formats + data validation + outline + merged cells all on one sheet, including "copy the copy again" |
+| `difftest_readsem_test.go` | Read semantics: values/types, formulas, shared strings, boundary coords, date divergence |
+
+Composite operations cannot be compared by "both sides run the same operation": openpyxl
+has no `MergeWorkbook`, and `copy_worksheet` is a shallow copy (it carries no pictures /
+conditional formats / data validations). There openpyxl instead acts as a **result
+validator**: excelgo performs the composite operation, then openpyxl independently opens
+the output and checks that semantics match and that **associated parts came along**
+(drawing / media / tables / comments) — the latter being the core of "layout fidelity" and
+something a plain semantic snapshot cannot see at all.
+
+```bash
+go test -run TestDiff ./...        # ~2.5 min
+```
+
+When openpyxl isn't installed these tests skip automatically (no hard CI dependency). Point
+at a specific interpreter with the `EXCELGO_PYTHON` environment variable.
+
+### Real bugs it caught
+
+The value of differential testing: these defects pass every unit test, because they can
+only surface through an outside implementation.
+
+| Defect | Symptom | Root cause |
+| --- | --- | --- |
+| Column-width ranges aren't interoperable | on the very same file, excelgo reads 3 columns as 12 while openpyxl reads only D | it wrote `<col min="4" max="6">` (legal, but consumers treat column defs as a sparse map). openpyxl expands per column itself, so this library now does too |
+| Copying a sheet with a table makes the whole file unreadable | openpyxl raises `Table with name X already exists` | part copying is byte-level, so the copy carries the same `id` and `name`/`displayName` — both of which are **workbook-scoped unique** |
+| Wrong conditional-format type makes the whole file unreadable | openpyxl raises `Unable to read workbook` | `cfType` is written into XML verbatim. The library's own doc comment says `cellIs`, but passing `cell` (the intuitive spelling) produces a broken file with **no validation at all** |
+| Same for data-validation type/operator | same | `typ`/`op` are likewise written verbatim, unvalidated |
+| Fill pattern / underline / border style / alignment | same | one class of defect: enum values treated as free text |
+| Copying/merging a sheet with charts loses them and corrupts the file | openpyxl raises `There is no item named 'xl/charts/chart1.xml'` | part copying only handled **one level** of rels. The chain is multi-level (sheet→drawing→chart), so drawing's rels got copied verbatim and nothing further — charts were never copied |
+| Merging a cross-workbook file with conditional formats corrupts it | openpyxl raises `IndexError: list index out of range` (reading `differential_styles[dxfId]`) | `dxfId` is a **workbook-scoped index**. Only `cellXf` was merged, not `<dxfs>`, leaving every `dxfId` dangling |
+| Merging a cross-workbook file with charts/tables corrupts it | openpyxl raises `Unknown relationship: rId1` | **double-write conflict**: the part transport rewrote the sheet's rIds and wrote the map, then the caller overwrote it with its own copy — losing the rId rewrite |
+| `CopySheetTo` of a cross-workbook file with conditional formats corrupts it | openpyxl raises `IndexError: list index out of range` | same class but a **different code path** (`copySheetAcrossMaps`, not `mergeOneSheet`). Fixing one and missing the other is why `mergeDxfsAndRemapSheet` is now shared by both |
+| Transporting named styles across workbooks corrupts the file | openpyxl raises `TypeError: expected <class 'int'>` | `<cellStyle xfId>` points at **cellStyleXfs** (not cellXfs), and those xfs reference fontId/fillId in turn. Moving only the `<cellStyles>` manifest leaves xfId dangling. Now handled by `StylesMerger.mergeStyleXfs` |
+| Integer attribute written as an empty string | openpyxl raises `TypeError: expected <class 'int'>` | `buildXF` emitted `xfId=""` when the source xf had none. **Integer attributes must be omitted entirely when absent**, never written empty |
+
+**A general lesson**: the write side must validate OOXML enum domains. Escaping cannot
+catch these — they aren't "wrong values", they're "the whole file becomes unreadable by
+consumers", and **the write returns nil and the file is produced**; only Excel/WPS
+reports "the file is corrupt" at open time, which is extremely hard to trace back to one
+field.
+
+Guard: centralized validation via `validateStyleEnums` / `validatePatternType` /
+`validCFTypes` / `validDVTypes`, returning explicit errors that list the correct values
+(passing `cell` now says "should be cellIs").
+
+### Known semantic differences vs openpyxl
+
+A few differences are **intentional** — each implementation is self-consistent on its own,
+but code migrated from openpyxl will trip on them.
+
+| Scenario | openpyxl | this library | Note |
+| --- | --- | --- | --- |
+| Reading a date cell (number + date format) | `cell.value` is a `datetime` | `GetCellValue` gives the raw serial; `Cell.GetTime()` converts to `time.Time` | this library never loses the raw value; conversion is explicit |
+| Writing formulas | writes no cached result | writes `result` | this library can produce formulas with a cached result |
+| Writing an empty string | round-trips to `None` | round-trips to `""` | openpyxl round-trip loss; `""` being a valid value is more correct here |
+| Conditional-format type name | `cellIs` | same (plus alias hints) | aligned |
+| Column-width ranges | expanded per column | expanded per column | aligned (merging is legal but consumers use a sparse map) |
+
+`TestDateSemanticsDivergence` locks the date behaviour down: if someone changes it to
+auto-convert to `datetime`, the test fails and points at this table.
+
+### Capability status vs openpyxl
+
+The gaps listed earlier have now been **filled in one by one**:
+
+| Capability | Status | API |
+| --- | --- | --- |
+| Chart creation | ✅ 12 types (bar/line/pie/scatter/area/doughnut/radar/bubble/surface + 3D) | `AddChart` / `(*WorkSheet).AddChart` |
+| Array formulas | ✅ emits `t="array"` + `ref`, CSE-capable | `SetCellArrayFormula` |
+| Multi-rule conditional formats | ✅ 10 types incl. ColorScale / DataBar / IconSet / top10 / aboveAverage | `SetConditionalFormatRules` |
+| Move region | ✅ values + styles, formulas remapped automatically | `MoveRange` |
+| Named styles | ✅ workbook-level `cellStyles` templates, shareable across sheets | `NewNamedStyle` / `SetNamedStyle` / `GetNamedStyles` |
+| Outline collapse | ✅ writes both `hidden` and `collapsed`, summary position configurable | `CollapseRows` / `ExpandRows` / `SetOutlineSummary` |
+| Read-only streaming | ✅ reads sheet XML on demand, skips unrelated parts | `OpenReader` / `StreamRows` |
+| write_only streaming write | ✅ appends row by row, memory doesn't grow with data | `NewStreamWriter` / `StreamSheet.Append` |
+| Printer-settings binary | ✅ read/write/transport, page-setup changes keep `r:id` | `GetPrinterSettings` / `SetPrinterSettings` |
+
+Still missing (low priority; openpyxl's own support is limited too):
+
+| Missing | Notes |
+| --- | --- |
+| Pivot tables | unsupported (openpyxl also only reads/writes definitions) |
+| Chartsheets | unsupported (charts must live in a normal worksheet) |
+| Synthesizing printer settings | this library can read, transport and write back the binary, but cannot **synthesize** a DEVMODE (it encodes a specific printer driver's capabilities). Same as openpyxl |
+| Advanced chart features | data tables / trendlines / secondary axis / combo charts not exposed |
+
+### Performance: write_only streaming write
+
+The regular write path rescans the entire sheet XML on **every cell write**, i.e.
+**O(cells × document length)**. Measured: 3000 rows × 4 columns takes **over 4 minutes**;
+streaming 20000 rows takes **224 ms** — roughly 3000× faster.
+
+```go
+w, _ := excelgo.NewStreamWriter("out.xlsx")
+head, _ := w.AddStyle(excelgo.Style{Font: &excelgo.FontStyle{Bold: true}})
+w.SetColWidth(1, 3, 18)
+
+ws, _ := w.NewSheet("data")
+ws.Append([]interface{}{excelgo.StreamCell{Value: "Name", Style: head}, "Qty"})
+for i := 1; i <= 20000; i++ {
+    ws.Append([]interface{}{fmt.Sprintf("item-%d", i), i})
+}
+w.Save()
+```
+
+Same constraints as openpyxl's `write_only`:
+
+- **Declare sheet names before writing rows** — the sheet-name ↔ `sheetN.xml` mapping
+  is fixed in `workbook.xml`; renaming after writing leaves data nowhere to go
+- **Rows must be appended in order** — `<row>` is a sequential stream; random
+  back-filling requires rescanning the whole document
+- **Styles must be registered up front via `AddStyle`** — you can't back-fill a
+  style index after the cell has been written
+- Strings use `t="inlineStr"` (no shared-string dedup — dedup means rescanning the
+  whole table, exactly what streaming exists to avoid); the cost is a slightly larger file
+
+One **hard format constraint** worth remembering: `archive/zip`'s `Writer` allows
+only one open entry at a time — `Create` on a new entry closes the previous one.
+So multiple sheets can't be written interleaved: rows go to temp files first,
+then get emitted as zip entries in order.
+
+### Two lessons
+
+**1. Relation chains must be walked recursively.** OOXML part relations are multi-level
+(`sheet → drawing → chart → embedded workbook`); handling only the first level leaves
+dangling relationships. The library now has `copyDownstreamParts` (same workbook) and
+`copyDownstreamPartsCross` (cross-workbook) for the recursion, and they place each
+downstream part in **its own canonical directory** (charts belong in `xl/charts/`, never
+in `xl/drawings/`).
+
+**2. Part transport and sheet write-back must be a single write point.**
+`copySheetPartsToTarget` does two things: moves parts and **rewrites the sheet's rId
+references**. It used to write the map itself, then the caller overwrote it with its
+own copy — which lacked the rId rewrite, so the sheet still pointed at the source's
+old rIds while the rels had already been renumbered. It now **returns** the rewritten
+content; the caller writes it back once, after every rewrite (style index / dxfId /
+shared strings / rId) is done. `TestPartTransportSingleWritePoint` guards this.
+
+**3. Cross-workbook transport must account for every workbook-scoped index table.**
+In `styles.xml` each table is indexed workbook-wide: `s` → cellXfs, `dxfId` → dxfs,
+`xfId` → cellStyleXfs — and those xfs reference fontId / fillId / borderId / numFmtId
+in turn: **a whole indirect chain**. Moving only the outermost table necessarily leaves
+dangling references, and the symptom is always an openpyxl `IndexError` or `TypeError`
+that says nothing about which table is short. Now `StylesMerger` (cellXf +
+cellStyleXfs) and `mergeDxfsAndRemapSheet` (dxfs + the cellStyles manifest) split the
+work, shared by both cross-workbook paths (`Merge` / `CopySheetTo`).
+
+**4. One write point per destination part.** Both dxf merging and named-style merging
+write `dstMap["xl/styles.xml"]`; if each starts from the original they overwrite each
+other — my first attempt used a standalone `mergeNamedStyles` that clobbered the
+freshly-merged dxfs, and openpyxl threw IndexError again. `appendNamedStyles` is now a
+pure function (bytes in, bytes out), sequenced inside `mergeDxfsAndRemapSheet`.
+
+**5. Omit Integer attributes entirely when absent.** Values like `xfId=""` make
+consumers fail `_convert("")` with `TypeError: expected <class 'int'>`, and the whole
+workbook becomes unreadable.
+
+**6. Password entry points must be explicit about their semantics.** OOXML's `password`
+attribute holds a **hash**. Historically this library's `ProtectSheet` required an
+already-hashed value while `ProtectWorkbook` took plaintext — an inconsistency that
+invites misuse (passing plaintext yields protection that looks real but can never be
+unlocked in Excel). `ProtectSheetWithPassword` (plaintext in, hashes internally) is now
+the recommended entry point; the old one stays for compatibility. The hash algorithm was
+independently verified against openpyxl, including Chinese text and special characters.
+
+Design notes:
+
+- **Normalize to the semantic layer.** The two sides necessarily lay out XML differently;
+  comparing bytes is meaningless, comparing "what a user can observe" is not.
+- **Separate real differences from capability differences.** openpyxl has features this
+  library lacks, and there are deliberate behavioural differences. Each case may carry
+  `Exempts` to skip specific **field paths** rather than the whole scenario — the former is
+  a real problem, the latter a known trade-off.
+- **Every exemption carries a reason.** For empty strings: excelgo writes a shared string and
+  reads back `""`, while openpyxl can't read back even its own empty string (measured: its
+  round-trip also yields `None`). That's a round-trip loss in openpyxl; this library's
+  behaviour better matches "an empty string is a valid value".
+
+
 ### Test fixtures (zero external dependency)
 
 All test fixtures are embedded in the `testfixtures/` subpackage (`//go:embed` packages
@@ -745,6 +1134,88 @@ package's `TestMain` before tests run.
 > Note: `TestCopySheetSharedVsIndependent` still attempts to read `新建 XLSX 工作表.xlsx` at
 > the repo root; when missing, that case auto-skips (doesn't affect the rest). To cover it,
 > place any workbook with floating pictures and a print area at that same name in the repo root.
+
+## XML security model (important)
+
+### Why not use an XML parser
+
+This isn't a stylistic preference — **`encoding/xml` round-trips break OOXML**.
+Measured with a lossless `xml.Decoder` + `xml.Encoder` round-trip on a WPS-style fragment:
+
+| Before | After round-trip |
+| --- | --- |
+| `<mc:AlternateContent>` | `<AlternateContent>` (**prefix lost**) |
+| `<x14:picture>` | `<picture>` |
+| `mc:Ignorable="x14ac"` | `x:Ignorable="x14ac"`, prefix renamed to `_xmlns:x14ac` |
+
+The last row is the killer: **the value of `mc:Ignorable` is a prefix name**. Go's
+`encoding/xml` does not preserve original prefixes (it resolves a prefix into
+`Name.Space` and generates its own on re-encode), so the prefix `Ignorable` points at no
+longer exists — **MCE (Markup Compatibility) fallback silently stops working**, changing how
+Excel and WPS interpret the file. Typed `Unmarshal`+`Marshal` is worse: any element not
+declared in the struct is dropped entirely (`definedNames` / `bookViews` / `calcPr` all
+disappear) and `r:id` gets rewritten to a different prefix.
+
+Hence this library edits XML parts **as strings/regex** — that is what preserves WPS
+inline pictures (`mc:AlternateContent` + `x14:picture`), namespaces and layout.
+
+### Escaping convention and guards
+
+The cost is that **every write site must escape by itself**. Convention:
+
+- all user data written into XML goes through **and only through** `safeText`
+  (text nodes) / `safeAttr` (attribute values);
+- the old names `escapeXML` / `escapeAttr` remain as equivalent aliases;
+- user data entering a **regex** must go through `regexp.QuoteMeta`.
+
+Protections in place:
+
+| Protection | Notes |
+| --- | --- |
+| Single entry point | `safeText` / `safeAttr` are the only sanctioned escaping exits; all write sites migrated |
+| Control-character stripping | XML 1.0 forbids `U+0000–U+0008 / U+000B / U+000C / U+000E–U+001F` (keeping `\t \n \r`). These **cannot be expressed as entities**; writing them makes a whole part not-well-formed and Excel reports the file as damaged. `safeText` strips them centrally |
+| Name validation | Worksheet names ≤ 31 chars, rejecting `\ / ? * [ ] :` (`AddSheet` / `NewSheet` / `RenameSheet` / `CopySheet`) |
+
+**Two automated guards** (neither relies on anyone remembering):
+
+1. `TestNoTaintedXMLWrite` — an AST taint-tracking guard with **zero manual exemptions**.
+   It analyses data flow per function: parameters, local variables, struct fields,
+   `range` variables and `append` results start out tainted; the taint is cleared by
+   `safeText`/`safeAttr`/`strconv.*`. A tainted value reaching an XML tag — whether as a
+   bare concatenation or as a function argument — fails the test.
+
+   **Safety is expressed by type, not by a list.** These named types count as certified
+   because they can only be produced by a validating constructor:
+
+   | Type | Constructor | Meaning |
+   | --- | --- | --- |
+   | `cellRef` | `newCellRef` | validated cell reference (`A1`) |
+   | `rangeRef` | `newRangeRef` | validated range reference (`A1:C10`) |
+   | `relID` | `newRelID` | library-generated relationship id (`rIdN`) |
+   | `styleIndex` | `idx` | style index (`fontId`/`numFmtId`, …) |
+   | `borderSideName` | — | fixed border side name |
+   | `xmlTagName` | `tagName` | fixed schema tag name (`v`/`f`/`r`) |
+   | `xmlFrag` | `frag` | newly built fragment whose content passed `safe*` |
+   | `partXML` | `part` | **pre-existing** part XML (reused, not newly written) |
+
+   So there is **no "forgot to add a list entry" failure mode** — new write sites are
+   protected by default (a bare `string` is always tainted). `TestGuardNoNameAllowlist`
+   locks this invariant: if a per-variable exemption list ever reappears in the guard,
+   that test fails.
+2. `TestXMLInjectionResistance` — end-to-end injection regression. 6 payload classes
+   (tag closing, closing + entities, attribute-quote escape, CDATA masquerade, comment
+   masquerade, control characters) × 12 write sites (cell values/formulas, shared strings,
+   comment text & author, hyperlink URL & display text, defined-name, doc properties,
+   table name, data validation, conditional format, header-footer / tab color). It asserts
+   every XML part is **well-formed** (Go's strict `encoding/xml` decoder) and that no extra
+   node was injected.
+
+> ⚠️ **When adding a new write site**: call `safeText` (text nodes) or `safeAttr`
+> (attribute values), and use `regexp.QuoteMeta` for anything entering a regex. If a
+> value really is "generated safely by the library", the right move is to **give it a
+> named type plus a validating constructor** (like `cellRef`/`newCellRef`) — not to add
+> another per-name exemption, which just relocates the "remember to update the list"
+> problem.
 
 ## License
 

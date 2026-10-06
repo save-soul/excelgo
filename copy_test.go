@@ -27,11 +27,19 @@ func TestCopySheetSharedVsIndependent(t *testing.T) {
 	}
 
 	sharedOut := filepath.Join(t.TempDir(), "shared.xlsx")
-	if err := CopySheet(sample, sharedOut, "Sheet1", WithMedia(MediaShared)); err != nil {
+	bf, err := Open(sample)
+	if err != nil {
+		t.Fatalf("open sample: %v", err)
+	}
+	if err := bf.CopySheetTo(sharedOut, "Sheet1", "", WithMedia(MediaShared)); err != nil {
 		t.Fatalf("shared copy failed: %v", err)
 	}
 	indepOut := filepath.Join(t.TempDir(), "indep.xlsx")
-	if err := CopySheet(sample, indepOut, "Sheet1", WithMedia(MediaIndependent)); err != nil {
+	bf2, err := Open(sample)
+	if err != nil {
+		t.Fatalf("open sample: %v", err)
+	}
+	if err := bf2.CopySheetTo(indepOut, "Sheet1", "", WithMedia(MediaIndependent)); err != nil {
 		t.Fatalf("independent copy failed: %v", err)
 	}
 

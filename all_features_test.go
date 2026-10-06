@@ -136,7 +136,7 @@ func TestAllFeatures(t *testing.T) {
 		checks := []struct {
 			cell, want string
 		}{
-			{"A1", "你好"}, {"A2", "42"}, {"A3", "3.14"}, {"A4", "1"},
+			{"A1", "你好"}, {"A2", "42"}, {"A3", "3.14"}, {"A4", "TRUE"},
 			{"A5", "inline"}, {"A7", "auto"},
 		}
 		for _, c := range checks {
@@ -294,15 +294,21 @@ func TestAllFeatures(t *testing.T) {
 	t.Run("CopySheet", func(t *testing.T) {
 		p := freshBook(t, "07_copy.xlsx")
 		_ = SetCellStr(p, "Sheet1", "A1", "origin")
-		if err := CopySheet(p, p, "Sheet1"); err != nil {
+		b, err := Open(p)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		if _, err := b.CopySheet("Sheet1", ""); err != nil {
 			t.Fatalf("CopySheet: %v", err)
+		}
+		if err := b.Save(); err != nil {
+			t.Fatalf("Save: %v", err)
 		}
 		lst := sheetList(t, p)
 		if len(lst) != 2 {
 			t.Fatalf("复制后应含 2 个工作表，实际 %v", lst)
 		}
 		// 新表（Sheet1_副本 或类似）应含 origin 数据
-		b, _ := Open(p)
 		found := false
 		for _, name := range lst {
 			if name == "Sheet1" {
@@ -321,12 +327,19 @@ func TestAllFeatures(t *testing.T) {
 		p := genPath("08_merge.xlsx")
 		cpFile(t, "testfixtures/target.xlsx", p)
 		before := len(sheetList(t, p))
-		err := MergeWorkbook(p, []SourceRef{
+		b, err := Open(p)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		err = b.Merge([]SourceRef{
 			{Workbook: "testfixtures/src1.xlsx", Sheet: "数据A"},
 			{Workbook: "testfixtures/src2.xlsx", Sheet: "数据B"},
 		})
 		if err != nil {
-			t.Fatalf("MergeWorkbook: %v", err)
+			t.Fatalf("Merge: %v", err)
+		}
+		if err := b.Save(); err != nil {
+			t.Fatalf("Save: %v", err)
 		}
 		after := len(sheetList(t, p))
 		if after != before+2 {
@@ -357,8 +370,10 @@ func TestAllFeatures(t *testing.T) {
 			t.Fatalf("SetSheetProps: %v", err)
 		}
 		fm := readMap(t, p)
-		if !strings.Contains(string(fm["xl/workbook.xml"]), `tabColor="FF00FF00"`) {
-			t.Errorf("workbook.xml 未见 Sheet1 的 tabColor 属性")
+		// 符合 OOXML 规范：tabColor 位于 worksheet XML 的 <sheetPr><tabColor rgb="..."/>，
+		// 而非 workbook.xml 的 <sheet> 属性（后者非标准，会被严格解析器拒绝）。
+		if !strings.Contains(string(fm["xl/worksheets/sheet1.xml"]), `<tabColor rgb="FF00FF00"`) {
+			t.Errorf("worksheet XML 未见 Sheet1 的 tabColor 属性")
 		}
 	})
 

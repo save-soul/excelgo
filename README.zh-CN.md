@@ -51,23 +51,28 @@ import (
 )
 
 func main() {
-	// 默认：共享媒体（体积小）
-	err := excelgo.CopySheet("input.xlsx", "output.xlsx", "Sheet1")
+	// 打开工作簿（返回 *excelgo.Book，别名 *excelgo.File）
+	f, err := excelgo.Open("./input.xlsx")
 	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 把工作表复制到另一个文件（跨工作簿）；默认共享媒体
+	if err := f.CopySheetTo("output.xlsx", "Sheet1", ""); err != nil {
 		log.Fatal(err)
 	}
 
 	// 独立媒体：复制体拥有自己的图片副本，可单独编辑/删除而不影响原表
-	err = excelgo.CopySheet("input.xlsx", "output2.xlsx", "Sheet1",
-		excelgo.WithMedia(excelgo.MediaIndependent))
-	if err != nil {
+	if err := f.CopySheetTo("output2.xlsx", "Sheet1", "",
+		excelgo.WithMedia(excelgo.MediaIndependent)); err != nil {
 		log.Fatal(err)
 	}
 
-	// 也可用工作表索引（1 基）与自定义后缀
-	err = excelgo.CopySheet("input.xlsx", "output3.xlsx", "1",
-		excelgo.WithSuffix("_副本"))
-	if err != nil {
+	// 也可在同一工作簿内用 1 基索引与自定义后缀复制，最后统一 Save
+	if _, err := f.CopySheet("1", "", excelgo.WithSuffix("_副本")); err != nil {
+		log.Fatal(err)
+	}
+	if err := f.Save(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -81,6 +86,55 @@ func main() {
 | 独立媒体 | `excelgo.MediaIndependent` | 复制体拥有独立图片副本，引用与关系一并重写 | 复制体需独立编辑/删除，与原表解耦 |
 
 默认策略为 `MediaShared`。
+
+### 对象式 API（类 excelize）
+
+`Open` / `Create` 返回 `*Book`（别名 `*File`）句柄，修改先缓存在内存，直到调用 `Save` / `SaveAs` 才一次性写盘——与 excelize 的用法一致。工作表复制（`CopySheet` / `CopySheetTo`）与跨工作簿合并（`Merge` / `MergeWorkbook`）既提供 `*Book` 方法，也提供等价的包级便捷函数（`CopySheet` / `MergeWorkbook`），可按场景选择（包级函数适合「单文件一次性操作」，对象式适合「同一工作簿连续多步操作后一次性保存」）。
+
+```go
+package main
+
+import (
+	"log"
+
+	"github.com/save-soul/excelgo"
+)
+
+func main() {
+	// 打开工作簿（返回 *excelgo.Book，别名 *excelgo.File）
+	f, err := excelgo.Open("./钢筋.xlsx")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 在同一工作簿内复制工作表（类 excelize 语义）；返回新表名
+	newName, err := f.CopySheet("Sheet1", "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	_ = newName
+
+	// 把工作表复制到另一个文件（跨工作簿）
+	if err := f.CopySheetTo("output.xlsx", "Sheet1", "", excelgo.WithMedia(excelgo.MediaIndependent)); err != nil {
+		log.Fatal(err)
+	}
+
+	// 把其它工作簿的工作表合并进本工作簿
+	if err := f.Merge([]excelgo.SourceRef{
+		{Workbook: "1月.xlsx", Sheet: "数据A"},
+		{Workbook: "2月.xlsx", Sheet: "数据B"},
+	}); err != nil {
+		log.Fatal(err)
+	}
+
+	// 一次性写盘（也可用 f.SaveAs("new.xlsx") 另存为新文件）
+	if err := f.Save(); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+由于修改缓存在内存，同一个 `f` 可以先做多次编辑（复制 / 合并 / 读写字单元格），最后只 `Save` 一次。
 
 ## 命令行工具
 
@@ -100,6 +154,12 @@ excelgo copy --independent input.xlsx output.xlsx Sheet1
 # 自定义后缀
 excelgo copy --suffix _副本 input.xlsx output.xlsx Sheet1
 
+# 直接指定新表名（--name）
+excelgo copy input.xlsx output.xlsx Sheet1 --name 汇总表
+
+# flags 可放在位置参数之前或之后，两者等价
+excelgo copy --name 汇总表 input.xlsx output.xlsx Sheet1
+
 # —— merge：跨工作簿合并 ——
 # 将 src1 的「数据A」表、src2 的「数据B」表搬入 target（target 需已存在，作为容器）
 excelgo merge target.xlsx "src1.xlsx:数据A" "src2.xlsx:数据B"
@@ -113,15 +173,45 @@ excelgo merge target.xlsx "src1.xlsx:Sheet1" --suffix _合
 ## API
 
 ```go
-func CopySheet(src, dst, sheetRef string, opts ...Option) error
+// 包级便捷函数（一次性打开→复制→另存，适合单文件操作）：
+func CopySheet(src, dst, sheetRef, newName string, opts ...Option) error
+
+// 对象式 API（推荐；可在同一工作簿连续多步操作后一次性 Save）：
+func (b *Book) CopySheet(sheetRef, newName string, opts ...Option) (string, error)    // 同一工作簿内复制
+func (b *Book) CopySheetTo(dstFile, sheetRef, newName string, opts ...Option) error   // 复制到另一个文件
 ```
 
-- `src` 源 `.xlsx` 路径
-- `dst` 输出 `.xlsx` 路径（会被覆盖写入）
 - `sheetRef` 工作表名称（如 `"Sheet1"`）或 1 基数字索引（如 `"1"`）
+- `newName` 复制后工作表名。**传空串 `""` 则用「源表名 + `WithSuffix` 后缀」**（默认 `_copy`）；
+  非空则直接用该名字，重名时自动补 `_1`/`_2` 序号避让
+- `dstFile` `CopySheetTo` 的目标文件路径；为空或与当前文件名相同则仅改内存/写回原文件
 - `opts` 可选配置：
   - `WithMedia(excelgo.MediaStrategy)` 设置媒体策略
-  - `WithSuffix(string)` 设置新工作表名后缀（默认 `"_copy"`）
+  - `WithSuffix(string)` 设置新工作表名后缀（默认 `"_copy"`，仅在 `newName` 为空时生效）
+
+```go
+// 最常见：直接指定新表名
+excelgo.CopySheet("src.xlsx", "dst.xlsx", "Sheet1", "汇总表")
+
+// 不关心名字，沿用默认后缀 Sheet1_copy
+excelgo.CopySheet("src.xlsx", "dst.xlsx", "Sheet1", "")
+```
+
+> **跨文件复制的语义**：包级 `CopySheet(src, dst, ...)` 与 `(*Book).CopySheetTo(dst, ...)`
+> 只搬运**被指定的那一张（或多张）工作表**到目标文件 —— 源工作簿的其它工作表一律不参与，
+> 目标工作簿原有工作表全部保留，源工作簿也不会被修改。它不是「整簿合并」，
+> 也不覆盖目标文件。实现上直接在两个内存 map 之间搬运该表的部件，不经过临时文件。
+>
+> 为保证贴入后格式/图片/打印区域正确，跨簿时会做必要的适配：合并 `styles.xml`
+> 并重映射 `s` 索引、共享字符串内联化、搬移 drawing/媒体/批注/图表等关联部件
+> 并重映射 `rId`、复制打印区域并重映射表名。
+>
+> 目标文件不存在时会先创建一个最小空工作簿再写入；若目标已存在则在其基础上追加。
+> 若目标文件**存在但无法解析**（损坏 / 加密 / 非 xlsx / 路径写错），则直接返回错误
+> 并**保持原文件不变** —— 绝不会静默用空工作簿覆盖你的数据。
+> 表名默认「源表名 + `WithSuffix` 后缀」（默认 `_copy`）；传第 4 个位置参数
+> `newName` 可直接指定（`excelgo.CopySheet(src, dst, "Sheet1", "汇总表")`），
+> 或用 `WithSuffix` 自定义后缀；重名时自动补数字序号避让。
 
 ### 合并工作表（跨工作簿）
 
@@ -129,10 +219,14 @@ func CopySheet(src, dst, sheetRef string, opts ...Option) error
 （合并后各表仍彼此独立）。适合把分散在多个文件里的工作表整合进一个文件。
 
 ```go
+// 包级便捷函数（一次性打开→合并→保存，dst 为目标容器路径，必须已存在）：
 func MergeWorkbook(dst string, sources []SourceRef, opts ...MergeOption) error
+
+// 对象式 API（推荐；可在同一工作簿连续多步操作后一次性 Save）：
+func (b *Book) Merge(sources []SourceRef, opts ...MergeOption) error            // 合并进本工作簿
 ```
 
-- `dst` 目标工作簿路径（**必须已存在**，作为合并容器，会被覆盖写入）
+- 合并的目标容器即当前 `Open` 得到的工作簿 `f` 自身（无需再传目标路径）；源工作表由 `sources` 指定从哪些文件搬入。
 - `sources` 源工作表列表，每项含 `Workbook`（源文件路径）与 `Sheet`（工作表名或 1 基索引）
 - `opts` 可选配置：
   - `WithRename(name string)` 统一指定搬入后的工作表名（同名冲突时自动加后缀避让）
@@ -148,11 +242,22 @@ func MergeWorkbook(dst string, sources []SourceRef, opts ...MergeOption) error
 - **页面属性保留**：打印区域（`_xlnm.Print_Area`，自动重映射 `localSheetId` 与表名）、
   分页符（`rowBreaks/colBreaks`）、页面布局等随工作表保留。
 
+> 重复打印行（`_xlnm.Print_Titles`）也会一并复制到新表，表名与 `localSheetId` 同步重映射。
+
 ```go
-err := excelgo.MergeWorkbook("汇总.xlsx", []excelgo.SourceRef{
+f, err := excelgo.Open("汇总.xlsx")
+if err != nil {
+    log.Fatal(err)
+}
+if err := f.Merge([]excelgo.SourceRef{
     {Workbook: "1月.xlsx", Sheet: "Sheet1"},
     {Workbook: "2月.xlsx", Sheet: "数据"},
-})
+}); err != nil {
+    log.Fatal(err)
+}
+if err := f.Save(); err != nil {
+    log.Fatal(err)
+}
 ```
 
 ### 工作表生命周期（就地编辑）
@@ -171,9 +276,14 @@ _ = excelgo.DeleteSheet("wb.xlsx", "2")
 // 移动工作表到指定位置（toIndex 为 1 基，1 表示最前）
 _ = excelgo.MoveSheet("wb.xlsx", "Sheet2", 1)
 
-// 改名（同名自动加后缀避让）
+// 改名（同名自动加序号避让，如 新名_1）
 _ = excelgo.RenameSheet("wb.xlsx", "旧名", "新名")
 ```
+
+> **表名限制（遵循 Excel 规则）**：新建 / 改名 / 复制时，表名最长 **31 个字符**，
+> 且不能含 `\ / ? * [ ] :`（`AddSheet` / `NewSheet` / `RenameSheet` / `CopySheet` 均会校验）。
+> 表名本身**允许**含 `& < > "` 等 XML 特殊字符 —— 写入 `workbook.xml` 时会自动转义，
+> 复制/合并/重命名均能正确处理。
 
 ### 单元格读写（多种格式）
 
@@ -252,6 +362,13 @@ _ = excelgo.InsertCols("wb.xlsx", "Sheet1", 2, 1)
 _ = excelgo.RemoveCols("wb.xlsx", "Sheet1", 2, 1)
 ```
 
+> **表尾边界校验**：插入位置允许等于「表尾 + 1」（在表尾之后追加，符合 Excel 行为），
+> 超过则返回错误；删除范围超出表尾同样报错。避免误传大数值在文件里生成大片无意义空行/空列。
+> 例：`InsertRows(wb, "Sheet1", 9999, 1)` 会返回
+> `插入行 9999 超出表尾（当前最大行 N，最多可在 N+1 处插入）`。
+> 表尾位置按实际内容判定（`<row r>`、`<c r>`、`<col min/max>`、`<row spans>`），
+> 包级函数与 `(*WorkSheet)` 方法行为一致。
+
 ### 区域读写（按矩形块）
 
 以矩形区域（如 `"A1:C10"`）为单位的整块读取与写入，复用在内存 map 上的一次读盘 / 逐格改写 /
@@ -319,7 +436,10 @@ idx, _ = excelgo.SetCellStyle("wb.xlsx", "Sheet1", "A1", style)
 > - 删除操作落入被删区间的引用改写为 `#REF!`（如删除第 2~3 列后 `A2+B2+C2` → `A2+#REF!+#REF!`）。
 > - 不支持 R1C1 引用（检测到原样保留）；跨表与带空格表名（`'My Sheet'!A1`）均正确识别。
 >
-> 浮动图片锚点不随行列操作平移，以保留图纸。
+> 浮动图片锚点（`oneCellAnchor` / `twoCellAnchor`）与 Excel 逻辑一致地随行列操作平移：
+> - 插入行/列时，锚定在该位置**及其之后**的图片按行列同步偏移，`colOff`/`rowOff` 像素偏移保持不变；
+> - 删除行/列时同样前移；若图片锚定的 `from` 落在被删区间内，则该图片随内容一并移除。
+> - 兼容 `xdr:` 前缀与默认命名空间两种 drawing 写法（Excel/WPS 与本库写出的格式均支持）。
 
 ### 面向对象 API（file → sheet → cell）
 
@@ -560,7 +680,7 @@ excelgo grouprows <文件.xlsx> <表> <起行> <止行> <级别>
 excelgo groupcols <文件.xlsx> <表> <起列> <止列> <级别>
 excelgo replace <文件.xlsx> <表> <旧文本> <新文本>
 excelgo docprops <文件.xlsx> [--title T] [--author A] [--subject S] [--keywords K]
-excelgo copy  <输入.xlsx> <输出.xlsx> <表> [--independent] [--suffix 后缀]
+excelgo copy  <输入.xlsx> <输出.xlsx> <表> [--name 新表名] [--independent] [--suffix 后缀]
 excelgo merge <目标.xlsx> <源.xlsx>:<表> [源.xlsx>:<表> ...] [--suffix 冲突后缀]
 ```
 
@@ -575,7 +695,7 @@ excelgo merge <目标.xlsx> <源.xlsx>:<表> [源.xlsx>:<表> ...] [--suffix 冲
 | `newsheet` | `NewSheet` | 新建工作表 |
 | `delsheet` | `DeleteSheet` | 删除工作表（清理从属部件） |
 | `movesheet` | `MoveSheet` | 调整工作表顺序 |
-| `renamesheet` | `RenameSheet` | 改名（冲突自动加后缀） |
+| `renamesheet` | `RenameSheet` | 改名（冲突自动加序号后缀） |
 | `getcell` | `GetCell` | 读单元格 |
 | `setcell` | `SetCellValue` / `SetCellStr` / `SetCellInt` / `SetCellNumeric` / `SetCellBool` / `SetCellFormula` | 按 `--type` 写入 |
 | `addpic` | `AddPicture` | 浮动图片（支持 `--cell/--col-off/--row-off/--scale`） |
@@ -602,8 +722,8 @@ excelgo merge <目标.xlsx> <源.xlsx>:<表> [源.xlsx>:<表> ...] [--suffix 冲
 | `grouprows` / `groupcols` | `GroupRows` / `GroupCols` | 行列分组大纲 |
 | `replace` | `ReplaceText` | 查找替换（返回替换次数） |
 | `docprops` | `SetDocProps` | 文档核心属性 |
-| `copy` | `CopySheet` | 工作表复制 |
-| `merge` | `MergeWorkbook` | 跨工作簿合并 |
+| `copy` | `CopySheet` / `(*Book).CopySheetTo` | 工作表复制（包级便捷 / 对象式） |
+| `merge` | `MergeWorkbook` / `(*Book).Merge` | 跨工作簿合并（包级便捷 / 对象式） |
 
 > 对象 API（`Open` → `Book.Sheet` → `WorkSheet.Cell/Range`）与上述全局函数行为完全一致，可先在内存中连续修改再一次性 `Save`/`SaveAs`。
 
@@ -632,6 +752,193 @@ go test ./...
 
 单元测试（`excelgo/*_test.go`、`cmd/excelgo/*_test.go`）覆盖对象 API、公式引用平移、复制/合并、样式去重、合并单元格/列宽/冻结/超链接/筛选、数据验证/条件格式/表格/批注/工作表属性、保护/分组/替换/文档属性等逻辑。
 
+### 差分测试（openpyxl 作为外部 oracle）
+
+单元测试有个结构性盲区：它们验证的是"本库输出符合本库的预期"。**若预期本身写错了，就查不出来。**
+
+`difftest/` 把 openpyxl（独立实现、被 Excel 生态广泛验证）当作外部 oracle：同一组文档、同一组方法，两侧分别执行，再把产物归一化为**语义快照**逐字段比对。它能抓出两类既有测试抓不到的问题：
+
+- 本库产出了别的工具读不出、或读成别的值的东西（真 bug）
+- 本库读不出 openpyxl 的正常产物（兼容性缺口）
+
+| 文件 | 作用 |
+| --- | --- |
+| `difftest/snapshot.py` | 把 xlsx 归一化为可比 JSON（语义层，不比 XML 字节） |
+| `difftest/op.py` | 按 JSON 指令用 openpyxl 执行同一组操作 |
+| `difftest_test.go` | 差分框架：驱动两侧、比对、按字段路径豁免 |
+| `difftest_write_test.go` | 写侧 34 个场景（值/公式/样式/行列/布局/工作表管理） |
+| `difftest_read_test.go` | 读侧 12 个场景（openpyxl 写 → excelgo 读）+ 往返一致性 |
+| `difftest_composite_test.go` | 复合操作：`CopySheet` / `CopySheetTo` / `MergeWorkbook` 的版式保真 |
+| `difftest_picture_test.go` | 图片：WPS 内嵌图片、浮动图片、媒体策略、`ExtractPicture` |
+| `difftest_style_test.go` | 样式枚举细节：下划线/边框线型/对齐/数字格式 + 非法值拦截 |
+| `difftest_chart_test.go` | 图表：**多级关系链**（sheet→drawing→chart）的搬运与闭合 |
+| `difftest_protect_test.go` | 工作表/工作簿保护：哈希算法与 Excel 兼容性、复制/合并后是否保留 |
+| `difftest_combo_test.go` | **组合场景（搬运既有文件）**：6 类 openpyxl 生成的组合 × 3 种操作 |
+| `difftest_selfcombo_test.go` | **组合场景（本库自产）**：图表创建 + 命名样式 + 表格 + 数组公式 + 条件格式 + 数据验证 + 折叠 + 合并单元格全部叠在一张表上，含"副本再复制一次"的二次组合 |
+| `difftest_readsem_test.go` | 读侧语义：值/类型、公式、共享字符串、边界坐标、日期语义差异 |
+
+复合操作不能"两侧执行同一操作再比对" —— openpyxl 没有 `MergeWorkbook`，
+`copy_worksheet` 也只是浅复制（不搬图片/条件格式/数据验证）。那里 openpyxl
+转为**结果验证器**：由 excelgo 执行复合操作，再用 openpyxl 独立打开产物，
+检查语义是否一致 + **关联部件是否跟着搬走**（drawing / media / tables /
+comments）—— 后者才是"版式保真"的核心，且普通语义快照完全看不到。
+
+```bash
+go test -run TestDiff ./...        # 约 2.5 分钟
+```
+
+未安装 openpyxl 时相关测试自动跳过（不阻塞 CI）。可用 `EXCELGO_PYTHON` 环境变量指定解释器。
+
+### 它抓到的真实 bug
+
+差分测试的价值在于：这些缺陷**单元测试全绿也发现不了**，因为它们要靠外部实现
+才能暴露。
+
+| 缺陷 | 症状 | 根因 |
+| --- | --- | --- |
+| 列宽范围写入不互操作 | 同一份文件，excelgo 读出 3 列都是 12，openpyxl 只读出 D 列 | 原写 `<col min="4" max="6">`（规范合法但消费方按稀疏字典处理）。openpyxl 自己逐列展开，本库改为逐列 |
+| 复制带表格的表 → 整个文件打不开 | openpyxl 抛 `Table with name X already exists` | 部件搬运是字节级的，副本带着相同的 `id` 与 `name`/`displayName`，而两者都是**工作簿级唯一**的 |
+| 条件格式类型写错 → 整个文件打不开 | openpyxl 抛 `Unable to read workbook` | `cfType` 原样写入 XML。库注释写的是 `cellIs`，但传 `cell`（直觉命名）就产出坏文件，且**无任何校验** |
+| 数据验证类型/运算符同上 | 同上 | `typ`/`op` 同样原样写入、无校验 |
+| 填充图案 / 下划线 / 边框线型 / 对齐 | 同上 | 同一类缺陷：枚举值被当自由文本处理 |
+| 含图表的工作表被复制/合并 → 图表全丢、文件损坏 | openpyxl 抛 `There is no item named 'xl/charts/chart1.xml'` | 部件搬运**只处理一层 rels**。关系链是多级的（sheet→drawing→chart），drawing 的 rels 被原样搬完就不管了，chart 从未被复制 |
+| 合并带条件格式的跨簿文件 → 文件损坏 | openpyxl 抛 `IndexError: list index out of range`（读 `differential_styles[dxfId]`） | `dxfId` 是**工作簿级索引**。早期只搬 `cellXf` 不搬 `<dxfs>`，sheet 里的 `dxfId` 变成悬空引用 |
+| 合并带图表/表格的跨簿文件 → 文件损坏 | openpyxl 抛 `Unknown relationship: rId1` | **双写冲突**：关联部件搬运内部重写了 sheet 的 rId 并写回，调用方随后又用自己的副本覆盖，把 rId 重写抹掉了 |
+| `CopySheetTo` 跨簿搬运带条件格式的文件 → 文件损坏 | openpyxl 抛 `IndexError: list index out of range` | 与上一条同类但**路径不同**（`copySheetAcrossMaps` 而非 `mergeOneSheet`）。修一处漏一处，故抽成 `mergeDxfsAndRemapSheet` 供两条路径共用 |
+| 跨簿搬运命名样式 → 文件损坏 | openpyxl 抛 `TypeError: expected <class 'int'>` | `<cellStyle xfId>` 指向的是 **cellStyleXfs**（不是 cellXfs），且那里的 xf 又引用 fontId/fillId。只搬 `<cellStyles>` 清单而不搬整条链，xfId 必然悬空。现由 `StylesMerger.mergeStyleXfs` 统一处理 |
+| Integer 属性写空串 → 文件损坏 | openpyxl 抛 `TypeError: expected <class 'int'>` | `buildXF` 把源 xf 缺失的 `xfId` 写成 `xfId=""`。**Integer 类型属性无值时必须整个省略**，不能写空串 |
+
+**一条通用教训**：写入端必须校验 OOXML 枚举取值域。转义挡不住这类问题 ——
+它们不是"值不对"，而是"整个文件消费方读不出来"，且**写入返回 nil、文件也能生成**，
+只有 Excel/WPS 打开时才报"文件损坏"，用户极难定位到是哪个字段。
+
+守卫方式：`validateStyleEnums` / `validatePatternType` / `validCFTypes` /
+`validDVTypes` 等集中校验，非法值返回明确错误并给出正确取值清单
+（如传 `cell` 会提示"应为 cellIs"）。
+
+### 与 openpyxl 的已知语义差异
+
+有几处**有意**的语义差异 —— 单独看每个实现都自洽，但迁移代码时会踩。
+
+| 场景 | openpyxl | 本库 | 说明 |
+| --- | --- | --- | --- |
+| 读日期单元格（数字 + 日期格式） | `cell.value` 直接给 `datetime` | `GetCellValue` 给原始序列号；`Cell.GetTime()` 转 `time.Time` | 本库不丢原始值，转换显式 |
+| 写公式 | 不写缓存结果值 | 写 result | 本库可写出"有缓存结果"的公式 |
+| 写空字符串 | 往返后变 `None` | 往返后仍是 `""` | openpyxl 的往返损失，本库更符合"空串是有效值" |
+| 条件格式类型名 | `cellIs` | 同（并接受别名提示） | 一致 |
+| 列宽范围 | 逐列展开 | 逐列展开 | 一致（规范允许合并，但消费方按稀疏字典处理） |
+
+`TestDateSemanticsDivergence` 锁死了日期这一项：若有人改成自动转 `datetime`，
+测试会失败并提示同步更新本表。
+
+### 相对 openpyxl 的能力现状
+
+原先列出的短板已**逐项补齐**：
+
+| 能力 | 状态 | API |
+| --- | --- | --- |
+| 图表创建 | ✅ 12 种类型（bar/line/pie/scatter/area/doughnut/radar/bubble/surface + 3D） | `AddChart` / `(*WorkSheet).AddChart` |
+| 数组公式 | ✅ 写 `t="array"` + `ref`，支持 CSE | `SetCellArrayFormula` |
+| 条件格式多规则 | ✅ 10 种类型，含 ColorScale / DataBar / IconSet / top10 / aboveAverage | `SetConditionalFormatRules` |
+| 移动区域 | ✅ 值+样式搬移，公式引用自动重映射 | `MoveRange` |
+| 命名样式 | ✅ 工作簿级 `cellStyles` 模板，可跨表复用 | `NewNamedStyle` / `SetNamedStyle` / `GetNamedStyles` |
+| 大纲折叠 | ✅ hidden + collapsed 双写，摘要行位置可配 | `CollapseRows` / `ExpandRows` / `SetOutlineSummary` |
+| 只读流式模式 | ✅ 按需读 sheet XML，不载入无关部件 | `OpenReader` / `StreamRows` |
+| write_only 流式写 | ✅ 逐行追加输出，内存不随数据量增长 | `NewStreamWriter` / `StreamSheet.Append` |
+| 打印机设置二进制 | ✅ 读取/写入/搬运保真，改页面设置不丢 `r:id` | `GetPrinterSettings` / `SetPrinterSettings` |
+
+仍缺失（优先级低，openpyxl 自身支持也有限）：
+
+| 缺失能力 | 说明 |
+| --- | --- |
+| 数据透视表 | 完全不支持（openpyxl 也只支持有限读写定义） |
+| 图表工作表 Chartsheet | 不支持（图表只能嵌在普通工作表里） |
+| 打印机设置二进制的**生成** | 本库能读、能搬、能写回，但无法**合成** DEVMODE（它编码的是具体打印机驱动的能力集）。这与 openpyxl 一致 |
+| 图表高级特性 | 数据表/趋势线/双轴/组合图未开放 |
+
+**本库的优势方向**（openpyxl 做不到或很难做）：
+- `CopySheet` / `MergeWorkbook` 保留版式、图片、图表、批注、条件格式、打印设置
+- WPS 单元格内嵌图片（`x14:picture` + `mc:AlternateContent`）的保真搬运
+- 默认**共享**媒体，`WithMedia(MediaIndependent)` 可选独立副本
+- 零依赖、单二进制、无 Python 运行时要求
+
+### 性能：write_only 流式写
+
+常规写入每写一格都重扫整份 sheet XML，复杂度 **O(单元格数 × 文档长度)**。
+实测 3000 行 × 4 列需 **4 分多钟**；流式写入 20000 行只需 **224 毫秒**
+（约 3000 倍差距）。
+
+```go
+w, _ := excelgo.NewStreamWriter("out.xlsx")
+head, _ := w.AddStyle(excelgo.Style{Font: &excelgo.FontStyle{Bold: true}})
+w.SetColWidth(1, 3, 18)
+
+ws, _ := w.NewSheet("数据")
+ws.Append([]interface{}{excelgo.StreamCell{Value: "名称", Style: head}, "数量"})
+for i := 1; i <= 20000; i++ {
+    ws.Append([]interface{}{fmt.Sprintf("项目-%d", i), i})
+}
+w.Save()
+```
+
+与 openpyxl 的 `write_only` 相同的约束：
+
+- **必须先声明表名再写行** —— sheet 名与 `sheetN.xml` 的对应关系在
+  `workbook.xml` 里定死，写完行再改名会让数据无处安放
+- **行必须按序追加** —— `<row>` 是顺序流，随机回填需要重扫全文档
+- **样式必须先 `AddStyle` 登记** —— 单元格写出后无法回填样式索引
+- 字符串走 `t="inlineStr"` 内联，不做共享去重（去重需回查整张表，
+  正是流式要消除的操作）；代价是文件略大
+
+实现上有一处**格式硬约束**值得记住：`archive/zip` 的 Writer 一次只允许一个
+打开的条目，`Create` 新条目会关闭前一个。所以多表不能交错写 —— 数据行
+先落到临时文件，落盘时再按序输出为 zip 条目。
+
+### 两条经验
+
+**1. 关系链必须递归搬运。** OOXML 的部件关系是多级的
+（`sheet → drawing → chart → 嵌入工作簿`），只处理第一层会留下悬空关系。
+库现在有 `copyDownstreamParts`（同簿）与 `copyDownstreamPartsCross`（跨簿）负责递归，
+并保证下游部件落在**自身的规范目录**（chart 必须在 `xl/charts/`，不能塞进
+`xl/drawings/`）。
+
+**2. 关联部件搬运与工作表写回必须是同一个写入点。**
+`copySheetPartsToTarget` 要做两件事：搬部件、**重写 sheet 里的 rId 引用**。
+早期它自己写 `dstMap`，调用方随后又用外层变量覆盖一次 —— 后者不含rId 重写，
+于是 sheet 仍指向源文件的旧 rId，而 rels 已换成新 ID，出现悬空引用。
+现在该函数**返回**改写后的内容，由调用方在所有改写（s 索引 / dxfId / 共享字符串 /
+rId）完成后一次性写回。`TestPartTransportSingleWritePoint` 守卫这条不变量。
+
+**3. 跨簿搬运要按"工作簿级索引"逐张表清点。** `styles.xml` 里每张表的下标都是
+工作簿级的：`s` → cellXfs、`dxfId` → dxfs、`xfId` → cellStyleXfs，
+而这些 xf 内部又引用 fontId / fillId / borderId / numFmtId —— **一整条间接链**。
+只搬最外层那一张表必然留下悬空引用，而且症状统一是 openpyxl 抛
+`IndexError` 或 `TypeError`，看不出是哪张表少了东西。
+现由 `StylesMerger`（cellXf + cellStyleXfs）与 `mergeDxfsAndRemapSheet`
+（dxfs + cellStyles 清单）分工负责，两条跨簿路径（`Merge` / `CopySheetTo`）共用。
+
+**4. 同一张目标表只能有一个写入点。** dxf 合并与命名样式合并都改
+`dstMap["xl/styles.xml"]`，若各自从头写就会互相覆盖 —— 我先写了独立的
+`mergeNamedStyles`，结果它把刚合并好的 dxfs 冲掉，openpyxl 又抛 IndexError。
+现在 `appendNamedStyles` 是纯函数（收字节、返回字节），由
+`mergeDxfsAndRemapSheet` 串起来一次写回。
+
+**5. Integer 属性无值时要整个省略。** `xfId=""` 这类空值属性会让消费方
+`_convert("")` 失败抛 `TypeError: expected <class 'int'`，整份文件读不出来。
+
+**6. 密码入口的语义必须显式。** OOXML 的 `password` 属性存的是**哈希值**。
+本库的 `ProtectSheet` 历史上要求传已哈希值，而 `ProtectWorkbook` 收明文 ——
+两者不一致必然导致误用（传真文会得到一个看似设了密码、实际在 Excel 里永远
+解不开的保护）。现新增 `ProtectSheetWithPassword`（收明文，内部哈希）作为
+推荐入口，旧入口保留兼容。哈希算法经 openpyxl 独立验证与 Excel 一致
+（含中文与特殊字符）。
+
+设计要点：
+
+- **归一化到语义层**。两侧 XML 排布必然不同，比字节无意义；比"用户能观察到的语义"才有意义。
+- **区分"真差异"与"能力差异"**。openpyxl 有些能力本库没有，也有本库刻意不同的行为。每个场景可带 `Exempts` 按**字段路径**精确豁免，而不是整场景跳过 —— 前者是真问题，后者是已知取舍。
+- **豁免必须写理由**。例如空串：`excelgo` 写共享字符串并能读回 `""`，而 openpyxl 连自己写的空串都读不回来（实测其往返同样为 `None`），这是 openpyxl 的往返损失，本库行为更符合"空串是有效值"的语义。
+
 ### 测试夹具（零外部依赖）
 
 所有测试夹具已内嵌于 `testfixtures/` 子包（`//go:embed` 打包 `full.xlsx`、`grid.xlsx`、`target.xlsx`、`src1.xlsx`、`src2.xlsx` 及 `ph_red.png`、`ph_blue.png`），并由 `excelgo` 包的 `TestMain` 在测试运行前自动物化到 `../testdata_tmp/`。
@@ -641,6 +948,80 @@ go test ./...
 - `testfixtures/` 仅含内嵌资源，编译进测试二进制、不污染库本体。
 
 > 说明：`TestCopySheetSharedVsIndependent` 仍会尝试读取仓库根目录的 `新建 XLSX 工作表.xlsx`，缺失时该用例自动跳过（不影响其余测试）。如需覆盖此用例，可把任意含浮动图片与打印区域的工作簿放到仓库根目录同名文件。
+
+## XML 安全模型（重要）
+
+### 为什么不用 XML 解析器
+
+这不是"偏好字符串"的问题，而是 **`encoding/xml` 往返会破坏 OOXML**。实测数据
+（用 `xml.Decoder` + `xml.Encoder` 对 WPS 风格片段做无损往返）：
+
+| 往返前的写法 | 往返后 |
+| --- | --- |
+| `<mc:AlternateContent>` | `<AlternateContent>`（**前缀丢失**） |
+| `<x14:picture>` | `<picture>` |
+| `mc:Ignorable="x14ac"` | `x:Ignorable="x14ac"` + 前缀被改名 `_xmlns:x14ac` |
+
+致命的是最后一条：`mc:Ignorable` 的**值是一个前缀名**。Go 的 `encoding/xml`
+不保留原始前缀（它把前缀解析成 `Name.Space`，重新编码时自己生成前缀），
+于是 `Ignorable` 指向的前缀不再存在 —— **MCE（Markup Compatibility）降级机制
+直接失效**，Excel 与 WPS 对该文件的解释随之改变。用结构体 `Unmarshal`+`Marshal`
+往返更糟：未在结构体中声明的元素会被整体丢弃（`definedNames`/`bookViews`/`calcPr`
+全部消失），且 `r:id` 会被改写成 `rId` 之外的其它前缀。
+
+因此本库**全程以字符串/正则编辑 XML 部件**，这也是保住 WPS 单元格内嵌图片
+（`mc:AlternateContent` + `x14:picture`）、命名空间与版式的前提。
+
+### 转义约定与护栏
+
+代价是**每个写入点都必须自行转义**。约定：
+
+- 所有用户数据写入 XML，**一律且只能**经 `safeText`（文本节点）/ `safeAttr`（属性值）出栈；
+- 旧名 `escapeXML` / `escapeAttr` 保留为等价别名；
+- 用户数据若要进入**正则**，必须用 `regexp.QuoteMeta`。
+
+三层防护：
+
+| 防护 | 说明 |
+| --- | --- |
+| 单一入口 | `safeText` / `safeAttr` 是唯一允许的转义出口；库内所有写入点已迁移 |
+| 控制字符剔除 | XML 1.0 禁止 `U+0000~U+0008 / U+000B / U+000C / U+000E~U+001F`（保留 `\t \n \r`）。这类字符**无法用实体表达**，写入后会让整个部件变成 not-well-formed，Excel 直接判损坏。`safeText` 统一剔除 |
+| 长度与字符校验 | 工作表名 ≤ 31 字符、拒绝 `\ / ? * [ ] :`（`AddSheet`/`NewSheet`/`RenameSheet`/`CopySheet`） |
+
+**两道自动防线**（都不依赖人记得）：
+
+1. `TestNoTaintedXMLWrite` —— AST 污点追踪护栏，**零人工豁免**。
+   分析每个函数的数据流：函数入参、局部变量、结构体字段、range 变量、`append` 结果
+   均视为"带污"，经 `safeText`/`safeAttr`/`strconv.*` 后污点清除；
+   带污量被拼进 XML 标签（无论是裸拼接还是作为函数实参）即失败。
+
+   **安全性由类型表达，而非清单**。以下具名类型被视为已认证 —— 因为它们只能经
+   带校验的构造函数产生，认证发生在构造处：
+
+   | 类型 | 构造 | 含义 |
+   | --- | --- | --- |
+   | `cellRef` | `newCellRef` | 已校验的单元格坐标（`A1` 形式） |
+   | `rangeRef` | `newRangeRef` | 已校验的区域引用（`A1:C10`） |
+   | `relID` | `newRelID` | 库内生成的关系 ID（`rIdN`） |
+   | `styleIndex` | `idx` | 样式索引（`fontId`/`numFmtId` 等） |
+   | `borderSideName` | — | 固定边框边名常量 |
+   | `xmlTagName` | `tagName` | 固定 schema 标签名（`v`/`f`/`r`） |
+   | `xmlFrag` | `frag` | 本次新建、内容已 `safe*` 的片段 |
+   | `partXML` | `part` | 部件里**既有**的原始 XML（读取后复用） |
+
+   因此**不存在"忘记往清单里加一条"这种漏检** —— 新增写入点默认受保护
+   （裸 `string` 一律带污）。`TestGuardNoNameAllowlist` 作为元测试锁死这一约束：
+   护栏内若重新出现按变量名的豁免清单，测试直接失败。
+2. `TestXMLInjectionResistance` —— 端到端注入回归。6 类载荷
+   （闭合标签、闭合加实体、属性引号逃逸、CDATA 伪装、注释伪装、控制字符）× 12 个
+   写入点（单元格值/公式、共享字符串、批注文本与作者、超链接 URL 与显示文本、
+   命名区域名、文档属性、表名、数据验证、条件格式、页眉页脚/标签颜色），
+   断言所有 XML 部件**良构**（`encoding/xml` 严格解码器逐个校验）且未注入多余节点。
+
+> ⚠️ **新增写入点时**：调用 `safeText`（文本节点）或 `safeAttr`（属性值），
+> 拼进正则时用 `regexp.QuoteMeta`；若某值确实是"库内生成的安全值"，
+> 正确做法是**为它建一个具名类型 + 带校验的构造函数**（如 `cellRef`/`newCellRef`），
+> 而**不是**往清单里加一条变量名豁免 —— 那样只是把"靠人记得"换了个地方。
 
 ## 许可证
 

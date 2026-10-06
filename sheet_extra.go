@@ -20,13 +20,13 @@ import (
 
 // MergeCells 把 ref 区域（如 "A1:C3"）合并为一块合并单元格。
 func (s *WorkSheet) MergeCells(ref string) error {
-	s.setWS(mergeCellsInWS(s.ws(), ref))
+	s.setWS(mergeCellsInWS(string(s.ws()), ref))
 	return nil
 }
 
 // UnmergeCells 取消 ref 区域内的合并（移除匹配的 <mergeCell>）。
 func (s *WorkSheet) UnmergeCells(ref string) error {
-	s.setWS(unmergeCellsInWS(s.ws(), ref))
+	s.setWS(unmergeCellsInWS(string(s.ws()), ref))
 	return nil
 }
 
@@ -44,7 +44,7 @@ func mergeCellsInWS(ws, ref string) string {
 		return re.ReplaceAllString(ws, body)
 	}
 	block := `<mergeCells count="1"><mergeCell ref="` + ref + `"/>` + `</mergeCells>`
-	return insertAfterSheetData(ws, block)
+	return insertAfterSheetData(ws, frag(block))
 }
 
 func unmergeCellsInWS(ws, ref string) string {
@@ -68,42 +68,57 @@ func unmergeCellsInWS(ws, ref string) string {
 
 // SetColWidth 设置单列（1 基列号）宽度（字符宽）。
 func (s *WorkSheet) SetColWidth(col int, width float64) error {
-	s.setWS(setColWidthInWS(s.ws(), col, col, width))
+	s.setWS(setColWidthInWS(string(s.ws()), col, col, width))
 	return nil
 }
 
 // SetColWidthRange 设置 [min,max] 连续列的宽度。
 func (s *WorkSheet) SetColWidthRange(min, max int, width float64) error {
-	s.setWS(setColWidthInWS(s.ws(), min, max, width))
+	s.setWS(setColWidthInWS(string(s.ws()), min, max, width))
 	return nil
 }
 
 // GetColWidth 读取覆盖 col 列的自定义宽度（未设置返回 0）。
 func (s *WorkSheet) GetColWidth(col int) float64 {
-	return getColWidthInWS(s.ws(), col)
+	return getColWidthInWS(string(s.ws()), col)
 }
 
 // SetRowHeight 设置行高（点）。
 func (s *WorkSheet) SetRowHeight(row int, height float64) error {
-	s.setWS(setRowHeightInWS(s.ws(), row, height, true))
+	s.setWS(setRowHeightInWS(string(s.ws()), row, height, true))
 	return nil
 }
 
 // SetRowVisible 设置行是否可见（hidden=false 隐藏）。
 func (s *WorkSheet) SetRowVisible(row int, visible bool) error {
-	s.setWS(setRowHiddenInWS(s.ws(), row, !visible))
+	s.setWS(setRowHiddenInWS(string(s.ws()), row, !visible))
 	return nil
 }
 
 // SetColVisible 设置列是否可见（hidden=false 隐藏）。
 func (s *WorkSheet) SetColVisible(col int, visible bool) error {
-	s.setWS(setColHiddenInWS(s.ws(), col, !visible))
+	s.setWS(setColHiddenInWS(string(s.ws()), col, !visible))
 	return nil
 }
 
+// setColWidthInWS 设置 [min, max] 区间的列宽。
+//
+// 关键实现选择：**逐列写 <col min="N" max="N"/>，不合并为区间**。
+// 合并成 `<col min="4" max="6">` 在 OOXML 规范上合法，但许多消费方
+// （实测 openpyxl 即如此）把 column_dimensions 当稀疏字典处理，只为显式
+// 出现的列建条目，区间内的其它列会被读成"未设置"。
+// openpyxl 自身即使宽度相同也逐列展开（min=max），说明这是被广泛验证的
+// 实现所选择的保守形式 —— 牺牲一点压缩换最大互操作性。
 func setColWidthInWS(ws string, min, max int, width float64) string {
+	if min > max {
+		min, max = max, min
+	}
 	w := strconv.FormatFloat(width, 'f', -1, 64)
-	newCol := fmt.Sprintf(`<col min="%d" max="%d" width="%s" customWidth="1"/>`, min, max, w)
+	var sb strings.Builder
+	for c := min; c <= max; c++ {
+		sb.WriteString(fmt.Sprintf(`<col min="%d" max="%d" width="%s" customWidth="1"/>`, c, c, w))
+	}
+	newCols := sb.String()
 	re := regexp.MustCompile(`(?s)<cols\b[^>]*>(.*?)</cols>`)
 	if m := re.FindStringSubmatch(ws); m != nil {
 		inner := m[1]
@@ -121,16 +136,16 @@ func setColWidthInWS(ws string, min, max int, width float64) string {
 			}
 			return ""
 		})
-		inner = inner + newCol
+		inner = inner + newCols
 		body := `<cols>` + inner + `</cols>`
 		return re.ReplaceAllString(ws, body)
 	}
-	block := `<cols>` + newCol + `</cols>`
+	block := `<cols>` + newCols + `</cols>`
 	// 放在 <sheetData> 之前（合法顺序）
 	if i := strings.Index(ws, "<sheetData"); i != -1 {
-		return ws[:i] + block + ws[i:]
+		return ws[:i] + string(block) + ws[i:]
 	}
-	return insertAfterSheetData(ws, block)
+	return insertAfterSheetData(ws, frag(block))
 }
 
 func getColWidthInWS(ws string, col int) float64 {
@@ -202,7 +217,7 @@ func setRowHeightInWS(ws string, row int, height float64, custom bool) string {
 	if !rowExists(ws, row) {
 		// 行不存在：插入带高度的空行
 		newRow := `<row r="` + strconv.Itoa(row) + `" ht="` + h + `" customHeight="1"/>`
-		return insertRowElement(ws, row, newRow)
+		return insertRowElement(ws, row, frag(newRow))
 	}
 	return modifyRowTag(ws, row, func(head string) string {
 		head = regexp.MustCompile(`\s+ht="[^"]*"`).ReplaceAllString(head, "")
@@ -219,7 +234,7 @@ func setRowHiddenInWS(ws string, row int, hidden bool) string {
 	}
 	if !rowExists(ws, row) {
 		newRow := `<row r="` + strconv.Itoa(row) + `"` + hv + `/>`
-		return insertRowElement(ws, row, newRow)
+		return insertRowElement(ws, row, frag(newRow))
 	}
 	return modifyRowTag(ws, row, func(head string) string {
 		head = regexp.MustCompile(`\s+hidden="\d"`).ReplaceAllString(head, "")
@@ -257,9 +272,9 @@ func setColHiddenInWS(ws string, col int, hidden bool) string {
 	}
 	block := fmt.Sprintf(`<cols><col min="%d" max="%d" hidden="1"/></cols>`, col, col)
 	if i := strings.Index(ws, "<sheetData"); i != -1 {
-		return ws[:i] + block + ws[i:]
+		return ws[:i] + string(block) + ws[i:]
 	}
-	return insertAfterSheetData(ws, block)
+	return insertAfterSheetData(ws, frag(block))
 }
 
 // ---------- 冻结窗格 ----------
@@ -270,7 +285,7 @@ func (s *WorkSheet) FreezePanes(ref string) error {
 	if err != nil {
 		return err
 	}
-	s.setWS(freezePanesInWS(s.ws(), col, row+1))
+	s.setWS(freezePanesInWS(string(s.ws()), col, row+1))
 	return nil
 }
 
@@ -316,9 +331,9 @@ func freezePanesInWS(ws string, col0, row1 int) string {
 	// 没有 <sheetViews>：创建
 	block := `<sheetViews><sheetView>` + pane.String() + `</sheetView></sheetViews>`
 	if i := strings.Index(ws, "<sheetData"); i != -1 {
-		return ws[:i] + block + ws[i:]
+		return ws[:i] + string(block) + ws[i:]
 	}
-	return insertAfterSheetData(ws, block)
+	return insertAfterSheetData(ws, frag(block))
 }
 
 func removePaneInWS(ws string) string {
@@ -351,14 +366,19 @@ func (s *WorkSheet) AddHyperlink(cell, url, displayText string) error {
 	})
 	s.fm()[sheetRelsFile] = serializeRelationships(rels)
 	// 3) worksheet 加 <hyperlinks>
-	ws := s.ws()
+	ws := string(s.ws())
 	ws = ensureWorksheetNamespaces(ws)
-	hyperlinkTag := `<hyperlink ref="` + cell + `" r:id="` + rid + `"/>`
+	// cell 规范化并校验：非法坐标直接拒绝，避免把未校验的用户串写入属性
+	ref := newCellRef(cell)
+	if ref == "" {
+		return fmt.Errorf("无效的单元格引用: %q", cell)
+	}
+	hyperlinkTag := frag(`<hyperlink ref="` + string(ref) + `" r:id="` + safeAttr(rid) + `"/>`)
 	if strings.Contains(ws, "<hyperlinks") {
 		ws = regexp.MustCompile(`(?s)(<hyperlinks\b[^>]*>)(.*?)(</hyperlinks>)`).ReplaceAllString(ws,
-			`$1$2`+hyperlinkTag+`$3`)
+			`$1$2`+string(hyperlinkTag)+`$3`)
 	} else {
-		ws = insertAfterSheetData(ws, `<hyperlinks>`+hyperlinkTag+`</hyperlinks>`)
+		ws = insertAfterSheetData(ws, frag(`<hyperlinks>`+string(hyperlinkTag)+`</hyperlinks>`))
 	}
 	s.setWS(ws)
 	return nil
@@ -368,11 +388,17 @@ func (s *WorkSheet) AddHyperlink(cell, url, displayText string) error {
 
 // AutoFilter 在 ref 区域添加自动筛选器。
 func (s *WorkSheet) AutoFilter(ref string) error {
-	ws := s.ws()
+	// 区域引用先经校验规范化，未校验的坐标不写入 XML
+	r := newRangeRef(ref)
+	if r == "" {
+		return fmt.Errorf("无效的区域引用: %q", ref)
+	}
+	ws := string(s.ws())
+	tag := `<autoFilter ref="` + string(r) + `"/>`
 	if strings.Contains(ws, "<autoFilter") {
-		ws = regexp.MustCompile(`(?s)<autoFilter\b[^>]*/>`).ReplaceAllString(ws, `<autoFilter ref="`+ref+`"/>`)
+		ws = regexp.MustCompile(`(?s)<autoFilter\b[^>]*/>`).ReplaceAllString(ws, tag)
 	} else {
-		ws = insertAfterSheetData(ws, `<autoFilter ref="`+ref+`"/>`)
+		ws = insertAfterSheetData(ws, frag(tag))
 	}
 	s.setWS(ws)
 	return nil
@@ -380,25 +406,57 @@ func (s *WorkSheet) AutoFilter(ref string) error {
 
 // ---------- 数据验证 ----------
 
+// validDVTypes 是 OOXML 规范（CT_DataValidation/@type）认可的类型。
+// 与条件格式同理：这些值原样写入 XML，写错会让消费方拒绝加载整个工作簿。
+var validDVTypes = map[string]bool{
+	"none": true, "whole": true, "decimal": true, "list": true,
+	"date": true, "time": true, "textLength": true, "custom": true,
+}
+
+// validDVOperators 是 OOXML 规范（ST_DataValidationOperator）认可的比较运算符。
+var validDVOperators = map[string]bool{
+	"between": true, "notBetween": true, "equal": true, "notEqual": true,
+	"greaterThan": true, "lessThan": true, "greaterThanOrEqual": true,
+	"lessThanOrEqual": true,
+}
+
 // AddDataValidation 为 ref 区域添加数据验证。typ 为 "list"/"whole"/"decimal"/"date" 等；
 // formula1/formula2 为公式（列表用 "a,b,c" 形式时调用方应自行包裹引号，或用 AddDataValidationList）。
+//
+// typ 与 op 必须是 OOXML 规范取值（见 validDVTypes / validDVOperators）——
+// 它们原样写入 XML 属性，非法取值会导致 openpyxl/Excel 拒绝加载工作簿，故提前拦截。
 func (s *WorkSheet) AddDataValidation(ref, typ, op, formula1, formula2 string, allowBlank bool) error {
-	ws := s.ws()
+	if !validDVTypes[typ] {
+		return fmt.Errorf("无效的数据验证类型 %q，合法的 OOXML 取值如："+
+			"list / whole / decimal / date / time / textLength / custom", typ)
+	}
+	if op != "" && !validDVOperators[op] {
+		return fmt.Errorf("无效的数据验证比较运算符 %q，合法的 OOXML 取值如："+
+			"between / equal / notEqual / greaterThan / lessThan / "+
+			"greaterThanOrEqual / lessThanOrEqual", op)
+	}
+	// 区域引用校验：未校验的坐标会直接进 XML 属性
+	r := newRangeRef(ref)
+	if r == "" {
+		return fmt.Errorf("无效的数据验证区域引用: %q", ref)
+	}
+	ref = string(r)
+	ws := string(s.ws())
 	blank := "0"
 	if allowBlank {
 		blank = "1"
 	}
 	var bld strings.Builder
-	bld.WriteString(`<dataValidation type="` + escapeAttr(typ) + `" allowBlank="` + blank + `"`)
+	bld.WriteString(`<dataValidation type="` + safeAttr(typ) + `" allowBlank="` + blank + `"`)
 	if op != "" {
-		bld.WriteString(` operator="` + escapeAttr(op) + `"`)
+		bld.WriteString(` operator="` + safeAttr(op) + `"`)
 	}
-	bld.WriteString(` sqref="` + escapeAttr(ref) + `">`)
+	bld.WriteString(` sqref="` + safeAttr(ref) + `">`)
 	if formula1 != "" {
-		bld.WriteString(`<formula1>` + escapeXML(formula1) + `</formula1>`)
+		bld.WriteString(`<formula1>` + safeText(formula1) + `</formula1>`)
 	}
 	if formula2 != "" {
-		bld.WriteString(`<formula2>` + escapeXML(formula2) + `</formula2>`)
+		bld.WriteString(`<formula2>` + safeText(formula2) + `</formula2>`)
 	}
 	bld.WriteString(`</dataValidation>`)
 	if strings.Contains(ws, "<dataValidations") {
@@ -409,7 +467,7 @@ func (s *WorkSheet) AddDataValidation(ref, typ, op, formula1, formula2 string, a
 			return open + mm[2] + bld.String() + mm[3]
 		})
 	} else {
-		ws = insertAfterSheetData(ws, `<dataValidations count="1">`+bld.String()+`</dataValidations>`)
+		ws = insertAfterSheetData(ws, frag(`<dataValidations count="1">`+bld.String()+`</dataValidations>`))
 	}
 	s.setWS(ws)
 	return nil
@@ -423,19 +481,67 @@ func (s *WorkSheet) AddDataValidationList(ref string, values []string, allowBlan
 
 // ---------- 条件格式 ----------
 
-// SetConditionalFormat 为 ref 区域添加一条表达式条件格式。
-// cfType 如 "expression"/"cellIs"/"duplicateValues"；formula 为条件公式（如 "A1>100"）；
-// st 为命中时应用的样式（写入 styles.xml 的 dxfs 差分格式）。
+// validCFTypes 是 OOXML 规范（CT_CfRule/@type）认可的条件格式类型。
+//
+// 这些值**不能随意写**：写错会让 openpyxl 直接拒绝加载整个工作簿
+// （实测 type="cell" 即导致 "Unable to read workbook"），Excel 同样会判损坏。
+// 常见的误用是把 "cellIs" 写成 "cell"（直觉命名），故在此显式校验并给出映射提示。
+var validCFTypes = map[string]bool{
+	"expression": true, "cellIs": true, "duplicateValues": true,
+	"uniqueValues": true, "top10": true, "aboveAverage": true,
+	"containsText": true, "notContainsText": true, "beginsWith": true,
+	"endsWith": true, "containsBlanks": true, "notContainsBlanks": true,
+	"containsErrors": true, "notContainsErrors": true,
+	"colorScale": true, "dataBar": true, "iconSet": true,
+	"timePeriod": true,
+}
+
+// cfTypeAliases 常见误写到正确取值的映射，用于给出更友好的错误提示。
+var cfTypeAliases = map[string]string{
+	"cell":         "cellIs",
+	"cellis":       "cellIs",
+	"formula":      "expression",
+	"duplicate":    "duplicateValues",
+	"unique":       "uniqueValues",
+	"textcontains": "containsText",
+	"icon":         "iconSet",
+	"databar":      "dataBar",
+	"colorscale":   "colorScale",
+}
+
+// SetConditionalFormat 为 ref 区域添加一条条件格式。
+//
+// cfType 必须是 OOXML 规范取值（见 validCFTypes），如 "expression"/"cellIs"/
+// "duplicateValues"；formula 为条件公式（如 "A1>100"）；st 为命中时应用的样式
+// （写入 styles.xml 的 dxfs 差分格式）。
+//
+// cfType 会**原样写入 XML**，因此非法取值不能靠转义兜底 —— 写错会让消费方
+// 拒绝加载整个工作簿。这里提前校验并对常见误写给出正确取值的提示。
 func (s *WorkSheet) SetConditionalFormat(ref, cfType, formula string, priority int, st Style) error {
-	ws := s.ws()
+	if !validCFTypes[cfType] {
+		if fixed, ok := cfTypeAliases[strings.ToLower(cfType)]; ok {
+			return fmt.Errorf("无效的条件格式类型 %q，应为 %q（OOXML 规范要求；"+
+				"写成 %q 会导致 openpyxl/Excel 拒绝加载整个工作簿）",
+				cfType, fixed, cfType)
+		}
+		return fmt.Errorf("无效的条件格式类型 %q，合法的 OOXML 取值如："+
+			"expression / cellIs / duplicateValues / containsText / colorScale / dataBar / iconSet",
+			cfType)
+	}
+	// 区域引用也需校验：未校验的坐标会直接进 XML 属性
+	r := newRangeRef(ref)
+	if r == "" {
+		return fmt.Errorf("无效的条件格式区域引用: %q", ref)
+	}
+	ws := string(s.ws())
 	fm := s.fm()
 	dxfId, err := addDxfToStyles(fm, st)
 	if err != nil {
 		return err
 	}
 	rule := fmt.Sprintf(`<cfRule type="%s" dxfId="%d" priority="%d"><formula>%s</formula></cfRule>`,
-		escapeAttr(cfType), dxfId, priority, escapeXML(formula))
-	ws = insertAfterSheetData(ws, `<conditionalFormatting sqref="`+escapeAttr(ref)+`">`+rule+`</conditionalFormatting>`)
+		safeAttr(cfType), dxfId, priority, safeText(formula))
+	ws = insertAfterSheetData(ws, frag(`<conditionalFormatting sqref="`+string(r)+`">`+rule+`</conditionalFormatting>`))
 	s.setWS(ws)
 	return nil
 }
@@ -449,6 +555,16 @@ func addDxfToStyles(fileMap map[string][]byte, st Style) (int, error) {
 			"/"+stylesPath, "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml")
 	}
 	xml := string(fileMap[stylesPath])
+	// 条件格式的 dxf 里也会写填充图案，同样需要先校验
+	// 条件格式的 dxf 同样走 buildFont/buildBorder/buildFill，枚举值同样要校验
+	if err := validateStyleEnums(st); err != nil {
+		return 0, err
+	}
+	if st.Fill != nil && st.Fill.Color != "" {
+		if _, err := validatePatternType(st.Fill.PatternType); err != nil {
+			return 0, err
+		}
+	}
 	dxf := buildDXF(st)
 	re := regexp.MustCompile(`(?s)<dxfs\b[^>]*>(.*?)</dxfs>`)
 	if m := re.FindStringSubmatch(xml); m != nil {
@@ -490,7 +606,7 @@ func buildDXF(st Style) string {
 // AddTable 把 ref 区域创建为一张结构化表格（ListObject），name 为表名（如 "Table1"）。
 // 表头取自区域首行的单元格值（为空则用 Column1..）。
 func (s *WorkSheet) AddTable(ref, name string) error {
-	ws := s.ws()
+	ws := string(s.ws())
 	fm := s.fm()
 	c1, r1, c2, _, err := parseRangeRef(ref)
 	if err != nil {
@@ -529,38 +645,61 @@ func (s *WorkSheet) AddTable(ref, name string) error {
 		ws = regexp.MustCompile(`(?s)(<tableParts\b[^>]*>)(.*?)(</tableParts>)`).ReplaceAllString(ws,
 			`$1$2<tablePart r:id="`+rid+`"/>$3`)
 	} else {
-		ws = insertAfterSheetData(ws, `<tableParts count="1"><tablePart r:id="`+rid+`"/></tableParts>`)
+		ws = insertAfterSheetData(ws, frag(`<tableParts count="1"><tablePart r:id="`+rid+`"/></tableParts>`))
 	}
 	s.setWS(ws)
 	// table xml
-	fm[tableFile] = []byte(buildTableXML(name, ref, num, headers))
+	fm[tableFile] = []byte(buildTableXML(fm, name, ref, headers))
 	fm["[Content_Types].xml"] = insertOverrideInContentTypes(fm["[Content_Types].xml"], "/"+tableFile,
 		"application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml")
 	return nil
 }
 
-func buildTableXML(name, ref string, id int, headers []string) string {
+func buildTableXML(fm map[string][]byte, name, ref string, headers []string) string {
 	var cols strings.Builder
 	cols.WriteString(fmt.Sprintf(`<tableColumns count="%d">`, len(headers)))
 	for i, h := range headers {
-		cols.WriteString(fmt.Sprintf(`<tableColumn id="%d" name="%s"/>`, i+1, escapeAttr(h)))
+		cols.WriteString(fmt.Sprintf(`<tableColumn id="%d" name="%s"/>`, i+1, safeAttr(h)))
 	}
 	cols.WriteString(`</tableColumns>`)
+	// 注意：table 的 id 属性是**表内容的一部分**，不是文件名序号。
+	// 复制工作表时表内容被整体搬走，若沿用源表的 id 会出现重复 ——
+	// 而 table id 必须全局唯一，否则 openpyxl/Excel 会拒绝加载工作簿。
+	// 故由调用方按当前工作簿内已有 table 的最大 id +1 重新分配。
+	id := nextTableContentID(fm)
 	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
 		`<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="` +
-		strconv.Itoa(id) + `" name="` + escapeAttr(name) + `" displayName="` + escapeAttr(name) +
-		`" ref="` + escapeAttr(ref) + `" totalsRowShown="0">` +
-		`<autoFilter ref="` + escapeAttr(ref) + `"/>` +
+		strconv.Itoa(id) + `" name="` + safeAttr(name) + `" displayName="` + safeAttr(name) +
+		`" ref="` + safeAttr(ref) + `" totalsRowShown="0">` +
+		`<autoFilter ref="` + safeAttr(ref) + `"/>` +
 		cols.String() +
 		`<tableStyleInfo name="TableStyleMedium2" showFirstColumn="0" showLastColumn="0" showRowStripes="1" showColumnStripes="0"/>` +
 		`</table>`
+}
+
+// nextTableContentID 返回当前工作簿内可用的 table id（已用最大值 +1）。
+// 扫描所有 xl/tables/table*.xml 的 id 属性取最大值。
+func nextTableContentID(fm map[string][]byte) int {
+	max := 0
+	re := regexp.MustCompile(`<table\b[^>]*\bid="(\d+)"`)
+	for name, data := range fm {
+		if !strings.HasPrefix(name, "xl/tables/table") || !strings.HasSuffix(name, ".xml") {
+			continue
+		}
+		for _, m := range re.FindAllStringSubmatch(string(data), -1) {
+			if n, err := strconv.Atoi(m[1]); err == nil && n > max {
+				max = n
+			}
+		}
+	}
+	return max + 1
 }
 
 // ---------- 批注 ----------
 
 // AddComment 在 cell 单元格添加批注 text（author 为作者，空则用 "Author"）。
 func (s *WorkSheet) AddComment(cell, text, author string) error {
-	ws := s.ws()
+	ws := string(s.ws())
 	fm := s.fm()
 	if author == "" {
 		author = "Author"
@@ -596,7 +735,7 @@ func (s *WorkSheet) AddComment(cell, text, author string) error {
 	var ab strings.Builder
 	ab.WriteString("<authors>")
 	for _, a := range authors {
-		ab.WriteString(`<author>` + escapeXML(a) + `</author>`)
+		ab.WriteString(`<author>` + safeText(a) + `</author>`)
 	}
 	ab.WriteString("</authors>")
 	if strings.Contains(cxml, "<authors>") {
@@ -610,18 +749,23 @@ func (s *WorkSheet) AddComment(cell, text, author string) error {
 		}
 	}
 	// 追加 comment
-	comment := `<comment ref="` + cell + `" authorId="` + strconv.Itoa(authorId) + `"><text><t xml:space="preserve">` +
-		escapeXML(text) + `</t></text></comment>`
+	// cell 规范化并校验：非法坐标直接拒绝
+	cref := newCellRef(cell)
+	if cref == "" {
+		return fmt.Errorf("无效的单元格引用: %q", cell)
+	}
+	comment := frag(`<comment ref="` + string(cref) + `" authorId="` + strconv.Itoa(authorId) + `"><text><t xml:space="preserve">` +
+		safeText(text) + `</t></text></comment>`)
 	if strings.Contains(cxml, "<commentList>") {
-		cxml = regexp.MustCompile(`(?s)(<commentList>)`).ReplaceAllString(cxml, `$1`+comment)
+		cxml = regexp.MustCompile(`(?s)(<commentList>)`).ReplaceAllString(cxml, `$1`+string(comment))
 	} else {
-		cxml = strings.Replace(cxml, "</comments>", "<commentList>"+comment+"</commentList></comments>", 1)
+		cxml = strings.Replace(cxml, "</comments>", "<commentList>"+string(comment)+"</commentList></comments>", 1)
 	}
 	fm[commentsFile] = []byte(cxml)
 	// worksheet 加 <comments r:id>
 	ws = ensureWorksheetNamespaces(ws)
 	if !strings.Contains(ws, "<comments") {
-		ws = insertAfterSheetData(ws, `<comments r:id="`+rid+`"/>`)
+		ws = insertAfterSheetData(ws, frag(`<comments r:id="`+rid+`"/>`))
 	}
 	s.setWS(ws)
 	return nil
@@ -698,15 +842,17 @@ type SheetProps struct {
 	TabColor      string // ARGB 十六进制（如 "FFFF0000"），空=不改变
 	ShowGridLines *bool  // 是否显示网格线
 	Zoom          int    // 缩放百分比（如 120），0=不改变
+	// 打印 / 页面设置（见 print.go）
+	PageMargins    *PageMargins  // 页边距
+	PageSetup      *PageSetup    // 页面设置
+	PrintArea      string        // 打印区域，如 "A1:D10"
+	HeaderFooter   *HeaderFooter // 页眉页脚
+	PrintTitleRows string        // 重复打印行，如 "1:1"
 }
 
 // SetProps 设置工作表展示属性。
 func (s *WorkSheet) SetProps(opts SheetProps) error {
-	ws := s.ws()
-	// 标签色属于 workbook.xml 的 <sheet> 节点
-	if opts.TabColor != "" {
-		s.setTabColor(opts.TabColor)
-	}
+	ws := string(s.ws())
 	if opts.ShowGridLines != nil || opts.Zoom != 0 {
 		ws = ensureWorksheetNamespaces(ws)
 		ws = ensureSheetViewWrap(ws)
@@ -724,7 +870,36 @@ func (s *WorkSheet) SetProps(opts SheetProps) error {
 		}
 		ws = regexp.MustCompile(`(?s)(<sheetView\b)`).ReplaceAllString(ws, `${1}`+grid+zoom)
 	}
+
+	// 打印属性（worksheet 级）
+	if opts.PageMargins != nil || opts.PageSetup != nil || opts.HeaderFooter != nil {
+		ws = ensureWorksheetNamespaces(ws)
+		ws = setPageMarginsInWS(ws, opts.PageMargins)
+		ws = setPageSetupInWS(ws, opts.PageSetup)
+		ws = setHeaderFooterInWS(ws, opts.HeaderFooter)
+	}
+
+	// 标签色（OOXML 规范位置：worksheet XML 的 <sheetPr><tabColor>）
+	if opts.TabColor != "" {
+		ws = setTabColorInWS(ws, opts.TabColor)
+	}
 	s.setWS(ws)
+
+	// 打印区域 / 重复行（workbook 级 definedName）
+	if opts.PrintArea != "" || opts.PrintTitleRows != "" {
+		idx := s.sheetLocalIndex()
+		if idx < 0 {
+			return fmt.Errorf("找不到工作表 %q 的序号", s.Name())
+		}
+		wbXML := s.fm()["xl/workbook.xml"]
+		if opts.PrintArea != "" {
+			wbXML = setOrReplaceDefinedName(wbXML, "_xlnm.Print_Area", idx, fmt.Sprintf("%s!%s", s.Name(), absRange(opts.PrintArea)))
+		}
+		if opts.PrintTitleRows != "" {
+			wbXML = setOrReplaceDefinedName(wbXML, "_xlnm.Print_Titles", idx, fmt.Sprintf("%s!%s", s.Name(), absRangeRows(opts.PrintTitleRows)))
+		}
+		s.fm()["xl/workbook.xml"] = wbXML
+	}
 	return nil
 }
 
@@ -735,26 +910,50 @@ func ensureSheetViewWrap(ws string) string {
 	}
 	block := `<sheetViews><sheetView></sheetView></sheetViews>`
 	if i := strings.Index(ws, "<sheetData"); i != -1 {
-		return ws[:i] + block + ws[i:]
+		return ws[:i] + string(block) + ws[i:]
 	}
-	return insertAfterSheetData(ws, block)
+	return insertAfterSheetData(ws, frag(block))
 }
 
 // ---------- 工作表保护 ----------
 
-// Protect 开启工作表保护（可选 password 为已哈希字符串；为空则不设密码）。
+// Protect 开启工作表保护。
+//
+// password 语义（**注意与 ProtectWorkbook 的差异**）：这里要求传**已哈希**的
+// Excel password verifier 值（如明文 "1234" 的哈希是 "CC3D"），本函数不做哈希。
+// 这是本库的既有约定，为保持兼容而保留。
+//
+// 新代码建议用 ProtectWithPassword —— 它收**明文**并在内部哈希，
+// 与 ProtectWorkbook 语义一致，不会搞混。为空则不设密码（仅锁结构）。
 func (s *WorkSheet) Protect(password string) error {
-	ws := s.ws()
+	return s.protectWithHash(password)
+}
+
+// ProtectWithPassword 开启工作表保护，password 传**明文**，内部按 Excel 标准
+// password verifier 算法哈希后写入。
+//
+// 推荐入口：与 ProtectWorkbook 语义一致（都收明文），避免"工作表要哈希、
+// 工作簿不用"这种容易踩的坑 —— 传错会导致用户以为设了密码、实际解不开。
+func (s *WorkSheet) ProtectWithPassword(plaintext string) error {
+	if plaintext == "" {
+		return s.protectWithHash("")
+	}
+	return s.protectWithHash(hashExcelPassword(plaintext))
+}
+
+// protectWithHash 写入 <sheetProtection>，passwordHash 为已哈希值（可空）。
+func (s *WorkSheet) protectWithHash(passwordHash string) error {
+	ws := string(s.ws())
 	ws = ensureWorksheetNamespaces(ws)
 	tag := `<sheetProtection sheet="1" selectLockedCells="1" selectUnlockedCells="1"`
-	if password != "" {
-		tag += ` password="` + escapeAttr(password) + `"`
+	if passwordHash != "" {
+		tag += ` password="` + safeAttr(passwordHash) + `"`
 	}
 	tag += `/>`
 	if strings.Contains(ws, "<sheetProtection") {
 		ws = regexp.MustCompile(`(?s)<sheetProtection\b[^>]*/>`).ReplaceAllString(ws, tag)
 	} else {
-		ws = insertAfterSheetData(ws, tag)
+		ws = insertAfterSheetData(ws, frag(tag))
 	}
 	s.setWS(ws)
 	return nil
@@ -764,13 +963,13 @@ func (s *WorkSheet) Protect(password string) error {
 
 // GroupRows 把 [r1,r2] 行设为分组大纲级别 level（1 基）。
 func (s *WorkSheet) GroupRows(r1, r2, level int) error {
-	s.setWS(groupRowsInWS(s.ws(), r1, r2, level))
+	s.setWS(groupRowsInWS(string(s.ws()), r1, r2, level))
 	return nil
 }
 
 // GroupCols 把 [c1,c2] 列设为分组大纲级别 level（1 基）。
 func (s *WorkSheet) GroupCols(c1, c2, level int) error {
-	s.setWS(setColWidthInWSGroup(s.ws(), c1, c2, level))
+	s.setWS(setColWidthInWSGroup(string(s.ws()), c1, c2, level))
 	return nil
 }
 
@@ -820,9 +1019,9 @@ func setColWidthInWSGroup(ws string, min, max, level int) string {
 	}
 	block := fmt.Sprintf(`<cols><col min="%d" max="%d" outlineLevel="%d"/></cols>`, min, max, level)
 	if i := strings.Index(ws, "<sheetData"); i != -1 {
-		return ws[:i] + block + ws[i:]
+		return ws[:i] + string(block) + ws[i:]
 	}
-	return insertAfterSheetData(ws, block)
+	return insertAfterSheetData(ws, frag(block))
 }
 
 // rebuildColWith 基于已有 col 原始串，重设 min/max 并视 level>0 追加 outlineLevel，
@@ -857,7 +1056,7 @@ func minInt(a, b int) int {
 // 覆盖共享字符串、内联字符串与公式单元格的结果文本。
 func (s *WorkSheet) Replace(old, new string) (int, error) {
 	fm := s.fm()
-	ws := s.ws()
+	ws := string(s.ws())
 	count := 0
 	// 1) 共享字符串
 	if ss, ok := fm["xl/sharedStrings.xml"]; ok {
@@ -932,7 +1131,7 @@ func (b *Book) SetDocProps(props map[string]string) error {
 			continue
 		}
 		re := regexp.MustCompile(`(?s)<` + tag + `\b[^>]*>.*?</` + tag + `>`)
-		elem := `<` + tag + `>` + escapeXML(v) + `</` + tag + `>`
+		elem := `<` + tag + `>` + safeText(v) + `</` + tag + `>`
 		if re.MatchString(xml) {
 			xml = re.ReplaceAllString(xml, elem)
 		} else {
@@ -969,7 +1168,8 @@ func (b *Book) SetDocProps(props map[string]string) error {
 // ---------- 通用插入辅助 ----------
 
 // insertRowElement 在 sheetData 内插入一个完整 <row ...>...</row> 元素（rowNum 行不存在时）。
-func insertRowElement(ws string, rowNum int, rowXML string) string {
+// rowXML 为已清洗的 <row> 片段（调用方保证其内容已过 safeText/safeAttr）。
+func insertRowElement(ws string, rowNum int, rowXML xmlFrag) string {
 	rowRe := regexp.MustCompile(`(?s)<row\b[^>]*\br="` + strconv.Itoa(rowNum) + `"[^>]*>.*?</row>`)
 	if rowRe.MatchString(ws) {
 		return ws
@@ -979,9 +1179,9 @@ func insertRowElement(ws string, rowNum int, rowXML string) string {
 	if sdOpen == -1 || sdClose == -1 {
 		wi := strings.LastIndex(ws, "</worksheet>")
 		if wi == -1 {
-			return ws + rowXML
+			return ws + string(rowXML)
 		}
-		return ws[:wi] + `<sheetData>` + rowXML + `</sheetData>` + ws[wi:]
+		return ws[:wi] + `<sheetData>` + string(rowXML) + `</sheetData>` + ws[wi:]
 	}
 	inner := ws[sdOpen:sdClose]
 	rowOpenRe := regexp.MustCompile(`<row\b[^>]*\br="(\d+)"`)
@@ -993,23 +1193,23 @@ func insertRowElement(ws string, rowNum int, rowXML string) string {
 			break
 		}
 	}
-	return ws[:insertAt] + rowXML + ws[insertAt:]
+	return ws[:insertAt] + string(rowXML) + ws[insertAt:]
 }
 
 // insertAfterSheetData 把 block 插入到 </sheetData> 之后（若没有则插在 </worksheet> 前）。
 // 用于 mergeCells/autoFilter/conditionalFormatting/dataValidations/hyperlinks/tableParts/comments
 // 等应位于 sheetData 之后的元素。
-func insertAfterSheetData(ws, block string) string {
+func insertAfterSheetData(ws string, block xmlFrag) string {
 	// 优先插入到 </sheetData> 之后（标准顺序：sheetData 之后才是 mergeCells/filter 等）
 	if i := strings.LastIndex(ws, "</sheetData>"); i != -1 {
-		return ws[:i+len("</sheetData>")] + block + ws[i+len("</sheetData>"):]
+		return ws[:i+len("</sheetData>")] + string(block) + ws[i+len("</sheetData>"):]
 	}
 	// 兜底：自闭合 <sheetData/> 形式，替换为显式闭合再加 block
 	if i := strings.Index(ws, "<sheetData/>"); i != -1 {
-		return ws[:i] + "<sheetData></sheetData>" + block + ws[i+len("<sheetData/>"):]
+		return ws[:i] + "<sheetData></sheetData>" + string(block) + ws[i+len("<sheetData/>"):]
 	}
 	if i := strings.LastIndex(ws, "</worksheet>"); i != -1 {
-		return ws[:i] + block + ws[i:]
+		return ws[:i] + string(block) + ws[i:]
 	}
-	return ws + block
+	return ws + string(block)
 }

@@ -37,11 +37,12 @@ const (
 	MediaIndependent
 )
 
-// Options 控制复制行为。使用 NewDefaultOptions 获得默认值，再用函数式选项调整。
+// Options 控制复制行为。使用 DefaultOptions 获得默认值，再用函数式选项调整。
 type Options struct {
 	// Media 控制媒体（图片等）的复制策略，默认 MediaShared。
 	Media MediaStrategy
 	// Suffix 追加到新工作表名后的后缀，默认 "_copy"。
+	// 仅在未通过 newName 参数显式指定表名时生效。
 	Suffix string
 }
 
@@ -62,17 +63,27 @@ func WithMedia(s MediaStrategy) Option {
 }
 
 // WithSuffix 设置新工作表名后缀（默认 "_copy"）。
+// 仅在 CopySheet/CopySheetTo 的 newName 参数为空时生效；
+// 需要精确指定表名时直接传 newName 参数。
 func WithSuffix(s string) Option {
 	return func(o *Options) { o.Suffix = s }
 }
 
-// CopySheet 将 src 工作簿中由 sheetRef（名称或 1 基索引）指定的工作表，
-// 复制为同名 + Suffix 的新工作表，写入 dst 路径。
-//
-//	sheetRef 可以是工作表名称（如 "Sheet1"）或 1 基数字索引（如 "1"）。
-//
-// 默认行为见 DefaultOptions；可通过 opts 调整媒体策略等。
-func CopySheet(src, dst, sheetRef string, opts ...Option) error {
+// indexOfSheetName 返回具名工作表在 <sheets> 中的 0 基序号，不存在返回 -1。
+func indexOfSheetName(sheets []Sheet, name string) int {
+	for i, s := range sheets {
+		if s.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// copySheetInMap 在内存 fileMap 中复制 sheetRef 指定的工作表，追加到末尾。
+// newName 为空时用「源表名 + Suffix」；非空时直接作为新表名（重名则补数字序号）。
+// 不读写磁盘，仅修改传入的 fileMap（调用方负责 Save/SaveAs 或另存）。
+// 返回新工作表名称。
+func copySheetInMap(fileMap map[string][]byte, sheetRef, newName string, opts ...Option) (string, error) {
 	o := DefaultOptions()
 	for _, fn := range opts {
 		fn(&o)
@@ -81,15 +92,10 @@ func CopySheet(src, dst, sheetRef string, opts ...Option) error {
 		o.Suffix = "_copy"
 	}
 
-	fileMap, err := readZipToMap(src)
-	if err != nil {
-		return err
-	}
-
 	// 解析 workbook.xml（仅读取信息）
 	wb := &Workbook{}
 	if err := getXMLFromMap(fileMap, "xl/workbook.xml", wb); err != nil {
-		return err
+		return "", err
 	}
 
 	// 查找源工作表
@@ -100,7 +106,7 @@ func CopySheet(src, dst, sheetRef string, opts ...Option) error {
 			srcSheet = &wb.Sheets.Sheet[idx-1]
 			srcIndex = idx - 1
 		} else {
-			return fmt.Errorf("工作表索引 %d 超出范围 (1-%d)", idx, len(wb.Sheets.Sheet))
+			return "", fmt.Errorf("工作表索引 %d 超出范围 (1-%d)", idx, len(wb.Sheets.Sheet))
 		}
 	} else {
 		for i, s := range wb.Sheets.Sheet {
@@ -111,33 +117,50 @@ func CopySheet(src, dst, sheetRef string, opts ...Option) error {
 			}
 		}
 		if srcSheet == nil {
-			return fmt.Errorf("找不到名称为 %q 的工作表", sheetRef)
+			return "", fmt.Errorf("找不到名称为 %q 的工作表", sheetRef)
 		}
 	}
 
 	// 获取源工作表文件路径：以 RID→rels 解析为唯一权威依据（WPS 删改后文件名与顺序解耦）。
-	// 解析失败（rel s 缺失/RID 不匹配/目标文件不存在）直接报错，不按位置命名臆测/兜底。
+	// 解析失败（rels 缺失/RID 不匹配/目标文件不存在）直接报错，不按位置命名臆测/兜底。
 	srcSheetFile, rerr := resolveWorksheetFile(fileMap, srcSheet.RID)
 	if rerr != nil {
-		return rerr
+		return "", rerr
 	}
 
 	// 复制工作表
 	newSheetNumber := getMaxSheetNumber(fileMap) + 1
 	newSheetFile, err := copyWorksheetWithRelationships(fileMap, srcSheetFile, newSheetNumber, o.Media)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// 生成新 ID
 	newSheetID := getMaxSheetID(wb) + 1
 	wbRels := &Relationships{}
 	if err := getXMLFromMap(fileMap, "xl/_rels/workbook.xml.rels", wbRels); err != nil {
-		return err
+		return "", err
 	}
 	newRId := fmt.Sprintf("rId%d", getMaxRId(wbRels)+1)
 
-	newSheetName := srcSheet.Name + o.Suffix
+	if newName != "" {
+		if err := validateSheetName(newName); err != nil {
+			return "", err
+		}
+	}
+	newSheetName := newName
+	if newSheetName == "" {
+		newSheetName = srcSheet.Name + o.Suffix
+	}
+	if indexOfSheetName(wb.Sheets.Sheet, newSheetName) >= 0 {
+		for i := 1; ; i++ {
+			cand := fmt.Sprintf("%s_%d", newSheetName, i)
+			if indexOfSheetName(wb.Sheets.Sheet, cand) < 0 {
+				newSheetName = cand
+				break
+			}
+		}
+	}
 
 	// 更新 workbook.xml
 	wbData := fileMap["xl/workbook.xml"]
@@ -180,12 +203,227 @@ func CopySheet(src, dst, sheetRef string, opts ...Option) error {
 	wbData = duplicatePrintArea(wbData, srcIndex, newSheetIndex, srcSheet.Name, newSheetName)
 	fileMap["xl/workbook.xml"] = wbData
 
-	// 写出新文件
-	if err := writeMapToZip(dst, fileMap); err != nil {
-		return err
+	return newSheetName, nil
+}
+
+// CopySheet 复制本工作簿内由 sheetRef（名称或 1 基索引）指定的工作表，追加到末尾
+//（excelize 式「同工作簿内复制」语义）。
+//
+// newName 为空字符串时用「源表名 + WithSuffix 后缀」（默认 "_copy"）；非空时直接
+// 作为新表名，重名则自动补数字序号避让。
+//
+// 操作基于内存 fileMap，不直接写盘；如需落盘请调用 Save/SaveAs。返回新工作表名称。
+//
+//	f, _ := excelgo.Open("./钢筋.xlsx")
+//	newName, _ := f.CopySheet("钢筋表", "")          // 沿用默认后缀
+//	newName, _ = f.CopySheet("钢筋表", "钢筋表-副本")  // 指定新表名
+//	f.Save()
+func (b *Book) CopySheet(sheetRef, newName string, opts ...Option) (string, error) {
+	return copySheetInMap(b.fileMap, sheetRef, newName, opts...)
+}
+
+// CopySheetTo 把本工作簿中 sheetRef 指定的工作表复制到 dstFile：
+//   - dstFile == ""：仅在内存中复制（同 CopySheet），由调用方 Save；
+//   - dstFile == b.Filename()：在内存中复制并写回原文件；
+//   - dstFile 为其它路径：把该工作表「加入」dstFile 工作簿后写回 dstFile，
+//     dstFile 原有工作表全部保留，本工作簿不被修改。
+//
+// newName 为空字符串时用「源表名 + WithSuffix 后缀」（默认 "_copy"）；非空时直接
+// 作为新表名，重名则自动补数字序号避让。
+//
+// 跨文件复制是「只搬这一张表」：源工作簿的其它工作表一律不参与，dst 也不会被
+// 整体覆盖。实现上直接在两个内存 map 之间搬运（源侧 b.fileMap → 目标侧 dst 的
+// fileMap），不经过临时文件、不做整簿合并；为保证贴入后格式/图片/打印区域正确，
+// 会做跨簿必要的适配：合并 styles.xml 并重映射 s 索引、共享字符串内联化、
+// 搬移 drawing/media/批注/图表等关联部件并重映射 rId、复制打印区域并重映射表名。
+func (b *Book) CopySheetTo(dstFile, sheetRef, newName string, opts ...Option) error {
+	if dstFile == "" || dstFile == b.filename {
+		if _, err := b.CopySheet(sheetRef, newName, opts...); err != nil {
+			return err
+		}
+		if dstFile == "" {
+			return nil
+		}
+		return b.Save()
 	}
 
-	return nil
+	o := DefaultOptions()
+	for _, fn := range opts {
+		fn(&o)
+	}
+	if o.Suffix == "" {
+		o.Suffix = "_copy"
+	}
+
+	// 读取目标工作簿到内存。严格区分「文件不存在」与「文件存在但打不开」：
+	//   - 不存在：创建最小空簿作为容器（正常的一次性创建场景）；
+	//   - 存在却打不开（损坏 / 加密 / 非 xlsx / 路径写错）：直接报错，绝不覆盖，
+	//     否则会静默把用户的数据文件替换成空工作簿。
+	dstBook, err := Open(dstFile)
+	if err != nil {
+		if _, statErr := os.Stat(dstFile); statErr == nil {
+			// 文件确实存在，只是无法解析 —— 属于错误，不应覆盖
+			return fmt.Errorf("目标文件 %s 已存在但无法读取（可能已损坏、加密或不是 xlsx），已放弃复制以免覆盖原数据: %w", dstFile, err)
+		} else if !os.IsNotExist(statErr) {
+			return fmt.Errorf("访问目标文件 %s 失败: %w", dstFile, statErr)
+		}
+		blank, cerr := Create()
+		if cerr != nil {
+			return fmt.Errorf("创建目标工作簿 %s 失败: %w", dstFile, cerr)
+		}
+		if serr := blank.SaveAs(dstFile); serr != nil {
+			return fmt.Errorf("创建目标工作簿 %s 失败: %w", dstFile, serr)
+		}
+		dstBook, err = Open(dstFile)
+		if err != nil {
+			return err
+		}
+	}
+
+	if _, err := copySheetAcrossMaps(b.fileMap, dstBook.fileMap, sheetRef, newName, o); err != nil {
+		return err
+	}
+	return dstBook.Save()
+}
+
+// copySheetAcrossMaps 把 srcMap 中 sheetRef 指定的那一张工作表搬入 dstMap，
+// 追加为末尾的新工作表；dstMap 原有内容（含其它工作表）全部保留。
+// 与 mergeOneSheet 的区别：只搬「这一张表」，不会把源工作簿整体并入。
+// newName 为空时用「源表名 + o.Suffix」。
+func copySheetAcrossMaps(srcMap, dstMap map[string][]byte, sheetRef, newName string, o Options) (string, error) {
+	// 1. 定位源工作表
+	srcWB := &Workbook{}
+	if err := getXMLFromMap(srcMap, "xl/workbook.xml", srcWB); err != nil {
+		return "", err
+	}
+	srcSheetFile, srcName, srcIndex, err := locateSheet(srcMap, srcWB, sheetRef)
+	if err != nil {
+		return "", err
+	}
+
+	// 2. 目标侧分配新的工作表文件名（避让已用编号）
+	newSheetNum := nextFreeNumber(dstMap, "xl/worksheets/sheet", ".xml")
+	newSheetFile := fmt.Sprintf("xl/worksheets/sheet%d.xml", newSheetNum)
+
+	// 3. 样式：收集源表用到的 s 索引，合并进目标 styles.xml 并重映射
+	srcWSBytes := srcMap[srcSheetFile]
+	usedStyles := collectUsedStyleIndexes(string(srcWSBytes))
+	merger, err := NewStylesMerger(dstMap["xl/styles.xml"], srcMap["xl/styles.xml"])
+	if err != nil {
+		return "", err
+	}
+	styleRemap, err := merger.Merge(srcMap["xl/styles.xml"], usedStyles)
+	if err != nil {
+		return "", err
+	}
+	newStyles, err := merger.Build()
+	if err != nil {
+		return "", err
+	}
+	dstMap["xl/styles.xml"] = newStyles
+
+	// 4. 改写 s 索引 + 共享字符串内联化（使新表自包含，不依赖源簿 sharedStrings 索引）
+	newWS := remapStyleIndexes(string(srcWSBytes), styleRemap)
+	// 4b. 条件格式的差分样式（dxf）也要搬并重映射 dxfId ——
+	//它与 cellXf 是**两张独立的表**，只搬 cellXf 会让 dxfId 悬空
+	// （openpyxl 抛 IndexError，Excel 判文件损坏）。
+	newWS = mergeDxfsAndRemapSheet(dstMap, srcMap, newWS, merger.StyleXfRemap())
+	if sst, ok := srcMap["xl/sharedStrings.xml"]; ok {
+		newWS = convertSharedStringsToInline(newWS, string(sst))
+	}
+	// 5. 搬移关联部件（drawing / media / 批注 / 图表 / 超链接等）并重映射 rId。
+	// 该函数会重写工作表里的 rId 引用并**返回**新内容 —— 必须在所有改写
+	// （s 索引、dxfId、共享字符串）完成后一次性写回，避免中途覆盖。
+	rewritten, err := copySheetPartsToTarget(srcMap, dstMap,
+		srcSheetFile, newSheetFile, newWS)
+	if err != nil {
+		return "", err
+	}
+	dstMap[newSheetFile] = []byte(rewritten)
+
+	// 6. 表名：与同工作簿内 CopySheet 保持一致 —— newName 非空则直接用，
+	// 否则「源表名 + Suffix」；若与既有表重名，再补数字序号避让。
+	dstWB := &Workbook{}
+	if err := getXMLFromMap(dstMap, "xl/workbook.xml", dstWB); err != nil {
+		return "", err
+	}
+	dstRels := &Relationships{}
+	if err := getXMLFromMap(dstMap, "xl/_rels/workbook.xml.rels", dstRels); err != nil {
+		return "", err
+	}
+	preferred := newName
+	if preferred == "" {
+		preferred = srcName + o.Suffix
+	}
+	// 避让后仍可能超长（后缀追加所致），此处统一校验
+	if err := validateSheetName(preferred); err != nil {
+		return "", err
+	}
+	finalName := preferred
+	if indexOfSheetName(dstWB.Sheets.Sheet, finalName) >= 0 {
+		for i := 1; ; i++ {
+			cand := fmt.Sprintf("%s_%d", preferred, i)
+			if indexOfSheetName(dstWB.Sheets.Sheet, cand) < 0 {
+				finalName = cand
+				break
+			}
+		}
+	}
+
+	newSheetID := getMaxSheetID(dstWB) + 1
+	newRId := fmt.Sprintf("rId%d", getMaxRId(dstRels)+1)
+	dstMap["xl/workbook.xml"] = insertSheetXML(dstMap["xl/workbook.xml"], finalName, newSheetID, newRId)
+	dstMap["xl/_rels/workbook.xml.rels"] = insertRelationshipInRels(
+		dstMap["xl/_rels/workbook.xml.rels"], newRId,
+		"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+		strings.TrimPrefix(newSheetFile, "xl/"))
+
+	// 7. 打印设置：打印区域 + 重复打印行，重映射 localSheetId 与表名后追加
+	newLocalSheetId := len(dstWB.Sheets.Sheet) // append 前已含既有表，末尾即新表序号
+	if pas := extractPrintFields(srcMap, srcIndex, srcName, newLocalSheetId, finalName); len(pas) > 0 {
+		dstMap["xl/workbook.xml"] = appendDefinedNames(dstMap["xl/workbook.xml"], pas)
+	}
+
+	// 8. [Content_Types].xml：为新表及新部件补 Override（幂等）
+	ctData := insertOverrideInContentTypes(dstMap["[Content_Types].xml"], "/"+newSheetFile,
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml")
+	for name := range dstMap {
+		switch {
+		case strings.HasPrefix(name, "xl/drawings/") && strings.HasSuffix(name, ".xml"):
+			ctData = insertOverrideInContentTypes(ctData, "/"+name, "application/vnd.openxmlformats-officedocument.drawing+xml")
+		case strings.HasPrefix(name, "xl/charts/") && strings.HasSuffix(name, ".xml"):
+			ctData = insertOverrideInContentTypes(ctData, "/"+name, "application/vnd.openxmlformats-officedocument.drawingml.chart+xml")
+		case strings.HasPrefix(name, "xl/comments/") && strings.HasSuffix(name, ".xml"):
+			ctData = insertOverrideInContentTypes(ctData, "/"+name, "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml")
+		}
+	}
+	dstMap["[Content_Types].xml"] = ctData
+
+	return finalName, nil
+}
+
+// CopySheet 包级便捷函数：将 src 工作簿中由 sheetRef（名称或 1 基索引）指定的工作表，
+// 复制到 dst 路径的工作簿中（一次性打开→复制→保存）。只搬这一张表：
+// src 的其它工作表不参与，dst 原有工作表全部保留。
+//
+// newName 为空字符串时用「源表名 + WithSuffix 后缀」（默认 "_copy"）；非空时直接
+// 作为新表名，重名则自动补数字序号避让。
+//
+//	excelgo.CopySheet(src, dst, "Sheet1", "汇总表")   // 指定新表名
+//	excelgo.CopySheet(src, dst, "Sheet1", "")         // 沿用默认后缀
+//
+// 等价于 excelgo.Open(src) 后调用 (*Book).CopySheetTo(dst, sheetRef, newName)。
+// 适合「单文件一次性操作」场景；若需要在同一工作簿上连续多次操作，推荐改用对象式 API：
+//
+//	f, _ := excelgo.Open(src)
+//	f.CopySheetTo(dst, sheetRef, newName)   // 跨文件
+//	// 或 f.CopySheet(sheetRef, newName) 同一工作簿内复制，再 f.Save()
+func CopySheet(src, dst, sheetRef, newName string, opts ...Option) error {
+	b, err := Open(src)
+	if err != nil {
+		return err
+	}
+	return b.CopySheetTo(dst, sheetRef, newName, opts...)
 }
 
 // ---------- XML 辅助结构 ----------
@@ -252,6 +490,9 @@ func readZipToMap(filename string) (map[string][]byte, error) {
 			return nil, err
 		}
 		data, err := io.ReadAll(rc)
+		// 先Close 再判err：ReadAll 失败时 rc 仍需释放；
+		// 且 zip 条目的读取器不 Close 会泄漏内部 flate 状态。
+		// Close 自身的错误在只读场景下无须处理。
 		rc.Close()
 		if err != nil {
 			return nil, err
@@ -305,11 +546,15 @@ func getXMLFromMap(fileMap map[string][]byte, filename string, v interface{}) er
 
 // ---------- 字符串插入函数（保留命名空间） ----------
 
+// insertSheetInWorkbookXML 向 <sheets> 末尾追加一个 <sheet> 标签。
+// sheetName 必须做 XML 属性转义：表名允许含 & < > " 等字符（Excel 本身也允许），
+// 裸写会破坏 workbook.xml 结构，导致整个 <sheets> 解析失败、所有工作表“消失”。
 func insertSheetInWorkbookXML(workbookXML []byte, sheetName string, sheetID int, rid string) []byte {
 	content := string(workbookXML)
 	// workbook.xml 中工作表关系属性使用带 r: 命名空间前缀的 r:id，必须保留前缀，
 	// 否则 Excel 无法解析工作表与关系的对应（文件判为损坏）。
-	sheetTag := fmt.Sprintf(`<sheet name="%s" sheetId="%d" r:id="%s"/>`, sheetName, sheetID, rid)
+	sheetTag := fmt.Sprintf(`<sheet name="%s" sheetId="%d" r:id="%s"/>`,
+		safeText(sheetName), sheetID, safeText(rid))
 	insertPos := strings.LastIndex(content, "</sheets>")
 	if insertPos == -1 {
 		insertPos = strings.Index(content, "<sheets>")
@@ -324,7 +569,9 @@ func insertSheetInWorkbookXML(workbookXML []byte, sheetName string, sheetID int,
 
 func insertRelationshipInRels(relsXML []byte, id, relType, target string) []byte {
 	content := string(relsXML)
-	relTag := fmt.Sprintf(`<Relationship Id="%s" Type="%s" Target="%s"/>`, id, relType, target)
+	// 三个属性值均需 XML 转义（target 可能含 & 等字符的部件名）
+	relTag := fmt.Sprintf(`<Relationship Id="%s" Type="%s" Target="%s"/>`,
+		safeText(id), safeText(relType), safeText(target))
 	insertPos := strings.LastIndex(content, "</Relationships>")
 	if insertPos == -1 {
 		return relsXML
@@ -346,33 +593,50 @@ func insertOverrideInContentTypes(ctXML []byte, partName, contentType string) []
 	return []byte(content[:insertPos] + overrideTag + content[insertPos:])
 }
 
-// 复制源工作表的打印区域（_xlnm.Print_Area）到新工作表。
-// 打印区域在 workbook.xml 中以 definedName 形式存在，localSheetId 为 0 基工作表序号，
-// 引用范围形如 "Sheet1!$A$1:$J$37"。复制时需把 localSheetId 改为新表序号、把表名改为新表名。
-// 若源表无打印区域则原样返回。
+// printSheetFields 列出随工作表复制而需要一并搬运的打印设置类 definedName。
+var printSheetFields = []string{"_xlnm.Print_Area", "_xlnm.Print_Titles"}
+
+// 复制源工作表的打印设置类 definedName（_xlnm.Print_Area 打印区域、
+// _xlnm.Print_Titles 重复打印行/列）到新工作表。
+// 这些设置在 workbook.xml 中以 definedName 形式存在，localSheetId 为 0 基工作表序号，
+// 引用范围形如 "Sheet1!$A$1:$J$37" / "Sheet1!$1:$1"。复制时需把 localSheetId 改为
+// 新表序号、把表名改为新表名。源表没有相应设置则跳过该项；若一项都没有则原样返回。
 func duplicatePrintArea(wbXML []byte, srcIndex, newIndex int, srcName, newName string) []byte {
 	content := string(wbXML)
-	// 匹配源表的打印区域 definedName
-	re := regexp.MustCompile(`(?s)<definedName\s+name="_xlnm\.Print_Area"\s+localSheetId="` + strconv.Itoa(srcIndex) + `"[^>]*>([^<]*)</definedName>`)
-	m := re.FindStringSubmatch(content)
-	if m == nil {
+	copied := false
+	for _, field := range printSheetFields {
+		re := regexp.MustCompile(`(?s)<definedName\s+name="` + regexp.QuoteMeta(field) +
+			`"\s+localSheetId="` + strconv.Itoa(srcIndex) + `"[^>]*>([^<]*)</definedName>`)
+		m := re.FindStringSubmatch(content)
+		if m == nil {
+			continue
+		}
+		newRange := replaceSheetNameInRange(m[1], srcName, newName)
+		// newRange 已是 XML 转义态（replaceSheetNameInRange 内部处理），此处不可再转义，
+		// 否则表名中的 & 会变成 &amp;amp; 双重转义。
+		newTag := fmt.Sprintf(`<definedName name="%s" localSheetId="%d">%s</definedName>`,
+			safeText(field), newIndex, newRange)
+		// 紧跟在该 definedName 之后插入
+		idx := strings.Index(content, m[0]) + len(m[0])
+		content = content[:idx] + newTag + content[idx:]
+		copied = true
+	}
+	if !copied {
 		return wbXML
 	}
-	srcRange := m[1]
-	// 把范围中的源表名替换为新表名（表名后跟 !）
-	newRange := replaceSheetNameInRange(srcRange, srcName, newName)
-	newTag := fmt.Sprintf(`<definedName name="_xlnm.Print_Area" localSheetId="%d">%s</definedName>`, newIndex, newRange)
-	// 插在源打印区域 definedName 之后
-	srcTagEnd := strings.Index(content, m[0]) + len(m[0])
-	return []byte(content[:srcTagEnd] + newTag + content[srcTagEnd:])
+	return []byte(content)
 }
 
 // 将引用范围（如 "Sheet1!$A$1:$J$37"）中的工作表名替换为新名。
 // 仅当范围以 srcName 开头并紧跟 ! 时才替换，避免误伤普通单元格引用。
+// replaceSheetNameInRange 把引用范围中的工作表名替换为新名。
+// 注意：srcName/newName 传入的是「原始（未转义）」表名；而 rng 来自 workbook.xml 字节，
+// 其中的表名是 XML 转义后的形式。表名含 & < > " 时两者不等价，因此匹配与替换
+// 都在转义后的空间进行，避免双重转义或替换失败。
 func replaceSheetNameInRange(rng, srcName, newName string) string {
-	prefix := srcName + "!"
+	prefix := safeText(srcName) + "!"
 	if strings.HasPrefix(rng, prefix) {
-		return newName + "!" + rng[len(prefix):]
+		return safeText(newName) + "!" + rng[len(prefix):]
 	}
 	return rng
 }
@@ -561,7 +825,18 @@ func copyWorksheetWithRelationships(fileMap map[string][]byte, srcSheetFile stri
 		newTargetPath := generateUniqueName(fileMap, targetDir, targetBase, targetExt)
 		fileMap[newTargetPath] = fileMap[targetPath]
 
+		// 表格部件带**工作簿级唯一约束**（id 与 displayName 都必须唯一）。
+		// 上面是字节级搬运，源表与副本会拿到相同的 id/名字，导致 openpyxl 报
+		// "Table with name X already exists"、Excel 判文件损坏。故搬完立即重映射。
+		if strings.HasPrefix(newTargetPath, "xl/tables/") && strings.HasSuffix(newTargetPath, ".xml") {
+			fileMap[newTargetPath] = reidentifyTable(fileMap, newTargetPath)
+		}
+
 		// 复制目标部件的关系文件（如果有），并按策略处理其引用的媒体
+		//
+		// 必须**递归**：关系链有多级（sheet -> drawing -> chart -> 嵌入工作簿）。
+		// 只处理一层的话，drawing 的 rels 被原样搬完就不管了，chartN.xml 从未被复制，
+		// 而 rels 仍指向它 —— 悬空关系，Excel 判定文件损坏。
 		targetRelsFile := path.Join(path.Dir(targetPath), "_rels", path.Base(targetPath)+".rels")
 		if fileExistsInMap(fileMap, targetRelsFile) {
 			newTargetRelsFile := path.Join(path.Dir(newTargetPath), "_rels", path.Base(newTargetPath)+".rels")
@@ -570,7 +845,15 @@ func copyWorksheetWithRelationships(fileMap map[string][]byte, srcSheetFile stri
 				// 重写目标部件 rels 中指向媒体的 Target，使其指向独立副本
 				relsData = rewriteMediaTargetsInRels(relsData, fileMap)
 			}
-			fileMap[newTargetRelsFile] = relsData
+			// 递归搬运该部件自己引用的下游部件（drawing -> chart 等）。
+			// 无论共享还是独立策略都要复制：chart 体积小，且"共享同一份 chart"
+			// 语义上就错了（改副本的图表会连带改源表）。
+			newRels, rerr := copyDownstreamParts(fileMap, fileMap[targetRelsFile],
+				path.Dir(targetPath), path.Dir(newTargetPath))
+			if rerr != nil {
+				return "", rerr
+			}
+			fileMap[newTargetRelsFile] = newRels
 		}
 
 		// 计算新 Target 相对于工作表目录的路径
@@ -740,4 +1023,93 @@ func getMaxSheetID(wb *Workbook) int {
 		}
 	}
 	return max
+}
+
+// copyDownstreamParts 递归复制 relsData 所引用的下游部件，并把 rels 里的
+// Target 改写为指向新副本。
+//
+// 为什么必须递归：OOXML 的关系链是多级的 ——
+//	sheet -> drawing -> chart -> （可选：嵌入工作簿 / colors / style）
+// 只处理第一层的话，drawing 的 rels 会被原样复制，而它指向的 chartN.xml
+// 从未被复制，于是留下悬空关系，Excel/WPS 判定文件损坏。
+//
+// srcDir/newDir 分别是该部件在源侧与目标侧的目录（用于解析与重算相对 Target）。
+// 部件名在目标侧统一重新生成唯一名，避免与既有部件冲突。
+// visited 记录已处理过的"源部件绝对路径"，防止环形引用导致无限递归。
+func copyDownstreamParts(fm map[string][]byte, relsData []byte, srcDir, newDir string) ([]byte, error) {
+	return copyDownstreamPartsVisited(fm, relsData, srcDir, newDir, map[string]bool{})
+}
+
+func copyDownstreamPartsVisited(fm map[string][]byte, relsData []byte,
+	srcDir, newDir string, visited map[string]bool) ([]byte, error) {
+	rels := &Relationships{}
+	if err := xml.Unmarshal(relsData, rels); err != nil {
+		// 解析失败就原样返回：宁可保留原样，也不要产出半成品关系
+		return relsData, nil
+	}
+	changed := false
+	for i := range rels.Relationship {
+		rel := &rels.Relationship[i]
+		if rel.TargetMode == "External" || rel.Target == "" {
+			continue
+		}
+		srcPath := resolveTarget(srcDir, rel.Target)
+		if !fileExistsInMap(fm, srcPath) || visited[srcPath] {
+			continue
+		}
+		// 媒体不在这里复制：drawing 自身 rels 里的 media 已由 MediaShared /
+		// MediaIndependent 策略处理过（共享则不复制，独立则复制并重写 Target）。
+		// 再复制一遍会产生无引用的孤儿部件。
+		if strings.HasPrefix(srcPath, "xl/media/") {
+			continue
+		}
+		visited[srcPath] = true
+
+		// 在目标目录生成唯一名并复制内容
+		// 下游部件保留**自身的规范目录**（chart 必须在 xl/charts/ 下）。
+		// 不能放到"引用方"的目录里 —— OOXML 的部件路径是约定好的，
+		// 放错位置会让 Excel 找不到部件。
+		dstDir := path.Dir(srcPath)
+		base := strings.TrimSuffix(path.Base(srcPath), path.Ext(srcPath))
+		ext := path.Ext(srcPath)
+		dstPath := generateUniqueName(fm, dstDir, base, ext)
+		fm[dstPath] = fm[srcPath]
+
+		// 表格部件有工作簿级唯一性约束（id / displayName）
+		if strings.HasPrefix(dstPath, "xl/tables/") && strings.HasSuffix(dstPath, ".xml") {
+			fm[dstPath] = reidentifyTable(fm, dstPath)
+		}
+
+		// 递归该部件自己的 rels
+		subRels := path.Join(dstDir, "_rels", path.Base(srcPath)+".rels")
+		if fileExistsInMap(fm, subRels) {
+			newSubRels, err := copyDownstreamPartsVisited(fm, fm[subRels],
+				dstDir, dstDir, visited)
+			if err != nil {
+				return nil, err
+			}
+			fm[path.Join(dstDir, "_rels", path.Base(dstPath)+".rels")] = newSubRels
+		}
+
+		// 重算指向新副本的相对 Target（相对于"引用方"的新目录）
+		newRel, err := zipPathRel(newDir, dstPath)
+		if err != nil {
+			return nil, err
+		}
+		if newRel != rel.Target {
+			rel.Target = newRel
+			changed = true
+		}
+	}
+	if !changed {
+		return relsData, nil
+	}
+	out, err := xml.MarshalIndent(rels, "", "  ")
+	if err != nil {
+		return relsData, nil
+	}
+	out = append([]byte(xml.Header), out...)
+	out = bytes.Replace(out, []byte("<Relationships>"),
+		[]byte(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`), 1)
+	return out, nil
 }

@@ -14,9 +14,11 @@ package excelgo
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // CellType 单元格写入类型（参考 excelize 的细分 API）。
@@ -36,6 +38,33 @@ const (
 	// CellTypeFormula 公式（写 <f>公式</f><v>可选结果</v>），类型按结果推断。
 	CellTypeFormula
 )
+
+// typedValue 把 <v> 文本按内容推断为 int / float64 / string。
+func typedValue(s, t string) (interface{}, error) {
+	if t == "str" {
+		return s, nil
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		if f == math.Trunc(f) && !strings.ContainsAny(s, ".eE") {
+			return int(f), nil
+		}
+		return f, nil
+	}
+	return s, nil
+}
+
+// GetCellValue 读取 sheetRef!cell 的值并按其类型返回原生 Go 值（见 WorkSheet.GetCellValue）。
+func GetCellValue(filename, sheetRef, cell string) (interface{}, error) {
+	b, err := Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	ws, err := b.Sheet(sheetRef)
+	if err != nil {
+		return nil, err
+	}
+	return ws.GetCellValue(cell)
+}
 
 // GetCell 读取 sheetRef 工作表中 cell（如 "A1"）的显示值（字符串）。
 // 返回空字符串表示单元格为空。共享字符串（t="s"）会解析为真实文本；公式（含 <f>）返回
@@ -61,25 +90,47 @@ func GetCell(filename, sheetRef, cell string) (string, error) {
 //   - string  → 共享字符串（t="s"）
 //   - int/int64/float  → 数值（默认类型）
 //   - bool    → 布尔（t="b"）
-//   - time.Time → 序列号数值（TODO：暂按 float64 处理，需要时再补日期格式）
+//   - time.Time → Excel 序列号 + 自动配日期格式（见 SetCellTime）
 //
 // 保留原单元格 s 样式索引；若单元格不存在则新建（s 默认 0）。
 func SetCellValue(filename, sheetRef, cell string, value interface{}) error {
+	// 类型矩阵与 (*WorkSheet).SetCellValue 保持一致：
+	// 两侧支持同样的类型，否则"方法能用、包级不能用"会成为难以察觉的坑。
 	switch v := value.(type) {
+	case nil:
+		return nil
 	case string:
 		return SetCellStr(filename, sheetRef, cell, v)
 	case bool:
 		return SetCellBool(filename, sheetRef, cell, v)
 	case int:
 		return SetCellInt(filename, sheetRef, cell, v)
+	case int8:
+		return SetCellInt(filename, sheetRef, cell, int(v))
+	case int16:
+		return SetCellInt(filename, sheetRef, cell, int(v))
+	case int32:
+		return SetCellInt(filename, sheetRef, cell, int(v))
 	case int64:
 		return SetCellInt(filename, sheetRef, cell, int(v))
+	case uint:
+		return SetCellNumeric(filename, sheetRef, cell, float64(v))
+	case uint8:
+		return SetCellInt(filename, sheetRef, cell, int(v))
+	case uint16:
+		return SetCellInt(filename, sheetRef, cell, int(v))
+	case uint32:
+		return SetCellInt(filename, sheetRef, cell, int(v))
+	case uint64:
+		return SetCellNumeric(filename, sheetRef, cell, float64(v))
 	case float64:
 		return SetCellNumeric(filename, sheetRef, cell, v)
 	case float32:
 		return SetCellNumeric(filename, sheetRef, cell, float64(v))
+	case time.Time:
+		return SetCellTime(filename, sheetRef, cell, v)
 	default:
-		return fmt.Errorf("不支持的值类型: %T", value)
+		return fmt.Errorf("不支持的值类型: %T（可用：nil/bool/int 族/uint 族/float/string/time.Time）", value)
 	}
 }
 
@@ -153,7 +204,7 @@ func setCellInMap(fileMap map[string][]byte, file, cell string, ct CellType, val
 
 	// 共享字符串：转为索引
 	finalValue := value
-	tAttr := ""
+	var tAttr xmlFrag
 	switch ct {
 	case CellTypeString:
 		idx, err := ensureSharedString(fileMap, value)
@@ -161,20 +212,21 @@ func setCellInMap(fileMap map[string][]byte, file, cell string, ct CellType, val
 			return err
 		}
 		finalValue = strconv.Itoa(idx)
-		tAttr = ` t="s"`
+		tAttr = xmlFrag(` t="s"`)
 	case CellTypeInline:
-		tAttr = ` t="inlineStr"`
+		tAttr = xmlFrag(` t="inlineStr"`)
 	case CellTypeBool:
-		tAttr = ` t="b"`
+		tAttr = xmlFrag(` t="b"`)
 	case CellTypeFormula:
-		tAttr = ` t="str"`
+		tAttr = xmlFrag(` t="str"`)
 		// 公式文本不应包含前导 "="（OOXML <f> 内不含 "="，由应用程序补）；
 		// 去掉调用方可能误带的前导 "="，避免 Excel/openpyxl 解析为 "=="。
 		finalValue = strings.TrimPrefix(value, "=")
 	}
 
-	newCellXML := buildCellXML(cell, tAttr, ct, finalValue, result)
-	ws = replaceOrInsertCell(ws, cell, newCellXML)
+	// buildCellXML 内部已对 value/result 过 safeText，产物是可信 XML 片段
+	newCellXML := frag(buildCellXML(newCellRef(cell), tAttr, ct, finalValue, result))
+	ws = replaceOrInsertCell(ws, cell, string(newCellXML))
 	fileMap[file] = []byte(ws)
 	return nil
 }
@@ -237,7 +289,7 @@ func buildSharedStrings(items []string) string {
 	b.WriteString(`">`)
 	for _, s := range items {
 		b.WriteString(`<si><t xml:space="preserve">`)
-		b.WriteString(escapeXML(s))
+		b.WriteString(safeText(s))
 		b.WriteString(`</t></si>`)
 	}
 	b.WriteString(`</sst>`)
@@ -247,24 +299,24 @@ func buildSharedStrings(items []string) string {
 // buildCellXML 构造 <c r="cell" [t="..."] [s="N"]> 元素。
 // 对已有单元格，s 在 replaceOrInsertCell 中保留；此处 s 缺省（新建时默认 0 由调用方决定，
 // 但为简洁：新建单元格不带 s，使用默认样式 0；若需保留调用方应传入 s）。
-func buildCellXML(cell, tAttr string, ct CellType, value, result string) string {
+func buildCellXML(cell cellRef, tAttr xmlFrag, ct CellType, value, result string) string {
 	// 读取现有 s（若 ws 中已有该单元格，在 replaceOrInsertCell 处理；此处仅构造值部分）
 	switch ct {
 	case CellTypeString, CellTypeBool, CellTypeNumeric, CellTypeDefault:
 		if value == "" {
-			return `<c r="` + cell + `"` + tAttr + `/>`
+			return `<c r="` + string(cell) + `"` + string(tAttr) + `/>`
 		}
-		return `<c r="` + cell + `"` + tAttr + `><v>` + escapeXML(value) + `</v></c>`
+		return `<c r="` + string(cell) + `"` + string(tAttr) + `><v>` + safeText(value) + `</v></c>`
 	case CellTypeInline:
-		return `<c r="` + cell + `"` + tAttr + `><is><t xml:space="preserve">` + escapeXML(value) + `</t></is></c>`
+		return `<c r="` + string(cell) + `"` + string(tAttr) + `><is><t xml:space="preserve">` + safeText(value) + `</t></is></c>`
 	case CellTypeFormula:
-		inner := `<f>` + escapeXML(value) + `</f>`
+		inner := `<f>` + safeText(value) + `</f>`
 		if result != "" {
-			inner += `<v>` + escapeXML(result) + `</v>`
+			inner += `<v>` + safeText(result) + `</v>`
 		}
-		return `<c r="` + cell + `"` + tAttr + `>` + inner + `</c>`
+		return `<c r="` + string(cell) + `"` + string(tAttr) + `>` + inner + `</c>`
 	}
-	return `<c r="` + cell + `"` + tAttr + `/>`
+	return `<c r="` + string(cell) + `"` + string(tAttr) + `/>`
 }
 
 // replaceOrInsertCell 把 worksheet 中 cell 对应的 <c> 替换为 newXML；若不存在则插入。
@@ -286,7 +338,7 @@ func replaceOrInsertCell(ws, cell, newXML string) string {
 	if err != nil {
 		rowNum = 0
 	}
-	return insertCellIntoRow(ws, rowNum+1, newXML)
+	return insertCellIntoRow(part(ws), rowNum+1, frag(newXML))
 }
 
 // extractSAttr 从 <c> 标签提取 s="N" 属性（含前导空格），无则返回 ""。
@@ -315,28 +367,29 @@ func injectSAttr(newXML, sAttr string) string {
 // insertCellIntoRow 把 newCell 插入 worksheet 中行号 rowNum 对应的 <row> 内。
 // 若该 <row> 已存在，插入到其 </row> 前；若不存在，新建 <row r="rowNum"> 并插入到
 // sheetData 内、按行序位于第一个更大行号之前（保持行序合法），无更大行则置于末尾。
-func insertCellIntoRow(ws string, rowNum int, newCell string) string {
+func insertCellIntoRow(ws partXML, rowNum int, newCell xmlFrag) string {
 	// 查找 <row r="rowNum" ...> ... </row>
 	rowRe := regexp.MustCompile(`(?s)<row\b[^>]*\br="` + strconv.Itoa(rowNum) + `"[^>]*>(.*?)</row>`)
-	if m := rowRe.FindStringSubmatchIndex(ws); m != nil {
+	if m := rowRe.FindStringSubmatchIndex(string(ws)); m != nil {
 		// 在该 row 的 </row> 前插入
-		closeTag := strings.LastIndex(ws[m[0]:m[1]], "</row>")
+		closeTag := strings.LastIndex(string(ws[m[0]:m[1]]), "</row>")
 		insertAt := m[0] + closeTag
-		return ws[:insertAt] + newCell + ws[insertAt:]
+		return string(ws[:insertAt]) + string(newCell) + string(ws[insertAt:])
 	}
 	// 无该行：查找 sheetData 范围内第一个 r > rowNum 的 <row>，插在其前；
 	// 否则插在最后一个 </row> 之后、</sheetData> 之前。
-	sdOpen := strings.Index(ws, "<sheetData")
-	sdClose := strings.LastIndex(ws, "</sheetData>")
+	ss := string(ws)
+	sdOpen := strings.Index(ss, "<sheetData")
+	sdClose := strings.LastIndex(ss, "</sheetData>")
 	if sdOpen == -1 || sdClose == -1 {
 		// 无 sheetData：创建
-		wi := strings.LastIndex(ws, "</worksheet>")
+		wi := strings.LastIndex(ss, "</worksheet>")
 		if wi == -1 {
-			return ws + `<sheetData><row r="` + strconv.Itoa(rowNum) + `">` + newCell + `</row></sheetData>`
+			return ss + `<sheetData><row r="` + strconv.Itoa(rowNum) + `">` + string(newCell) + `</row></sheetData>`
 		}
-		return ws[:wi] + `<sheetData><row r="` + strconv.Itoa(rowNum) + `">` + newCell + `</row></sheetData>` + ws[wi:]
+		return ss[:wi] + `<sheetData><row r="` + strconv.Itoa(rowNum) + `">` + string(newCell) + `</row></sheetData>` + ss[wi:]
 	}
-	inner := ws[sdOpen:sdClose]
+	inner := ss[sdOpen:sdClose]
 	rowOpenRe := regexp.MustCompile(`<row\b[^>]*\br="(\d+)"`)
 	insertAt := sdClose // 默认放 sheetData 末尾
 	prevRowEnd := sdOpen
@@ -368,7 +421,7 @@ func insertCellIntoRow(ws string, rowNum int, newCell string) string {
 			insertAt = sdOpen + openEnd + 1
 		}
 	}
-	return ws[:insertAt] + `<row r="` + strconv.Itoa(rowNum) + `">` + newCell + `</row>` + ws[insertAt:]
+	return string(ws[:insertAt]) + `<row r="` + strconv.Itoa(rowNum) + `">` + string(newCell) + `</row>` + string(ws[insertAt:])
 }
 
 // readCellValue 从 worksheet XML 读取 cell 的显示值：
@@ -416,6 +469,14 @@ func readCellValue(fileMap map[string][]byte, ws, cell string) string {
 			return unescapeXML(t[1])
 		}
 		return ""
+	case "b":
+		if v := regexp.MustCompile(`(?s)<v>(.*?)</v>`).FindStringSubmatch(inner); v != nil {
+			if v[1] == "1" {
+				return "TRUE"
+			}
+			return "FALSE"
+		}
+		return "FALSE"
 	default:
 		if v := regexp.MustCompile(`(?s)<v>(.*?)</v>`).FindStringSubmatch(inner); v != nil {
 			return v[1]
@@ -431,13 +492,238 @@ func extractCellTag(ws, cell string) string {
 	return m
 }
 
-// escapeXML / unescapeXML 处理单元格文本中的 XML 特殊字符。
-func escapeXML(s string) string {
+// safeText 把用户数据转为可安全写入 **XML 文本节点** 的字符串。
+//
+// 约定（务必遵守）：
+//
+//	所有写入 xlsx 内部 XML 的用户数据，一律且只能经由本函数（或 safeAttr）出栈。
+//	直接拼接用户数据即为漏洞 —— 见 TestNoUnescapedXMLWrite 静态检查。
+//
+// 做两件事：
+//  1. 转义 5 个 XML 实体：& < > " '（' 在文本节点可不转义，但转义更保险）；
+//  2. 剔除 XML 1.0 规范禁止的控制字符（U+0000~U+0008 / U+000B / U+000C /
+//     U+000E~U+001F，保留 \t \n \r）。这类字符**无法用实体表达**，
+//     写入后整个部件会变成 not-well-formed，Excel/WPS 直接判文件损坏。
+//     攻击者一个 0x00 即可报废整份文档，这是"XML 注入"最隐蔽的形态。
+func safeText(s string) string {
+	if hasIllegalXMLChar(s) {
+		s = stripIllegalXMLChar(s)
+	}
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
 	return r.Replace(s)
 }
 
+// safeAttr 把用户数据转为可安全写入 **XML 属性值**（带引号包裹的位置）的字符串。
+// 语义与 safeText 相同；单独命名是为了让代码审查时一眼看出"这是属性上下文"。
+func safeAttr(s string) string { return safeText(s) }
+
+// hasIllegalXMLChar 判断是否含 XML 1.0 不允许的控制字符（不含 \t \n \r）。
+func hasIllegalXMLChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' {
+			return true
+		}
+	}
+	return false
+}
+
+// stripIllegalXMLChar 剔除 XML 1.0 不允许的控制字符。
+func stripIllegalXMLChar(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 func unescapeXML(s string) string {
+	// 单次扫描即可：Replacer 自左向右逐位匹配，即使 &amp; 排在最后，
+	// 遇到 "&amp;lt;" 时也会先消耗掉 "&amp;" 而不会被 "&lt;" 抢先匹配，
+	// 结果 "&lt;"（这正是 XML 语义要求的字面量文本）。
 	r := strings.NewReplacer("&quot;", `"`, "&lt;", "<", "&gt;", ">", "&amp;", "&")
 	return r.Replace(s)
+}
+
+// ---------- 已认证的内部构造（用类型表达"安全"这一事实） ----------
+//
+// XML 写入护栏（guard_taint_test.go）需要区分"用户输入"与"库内生成的安全值"。
+// 若二者都是 string，静态分析无法辨别，只能靠人工豁免清单 —— 那意味着新增写入点
+// 时要靠人记得填清单，迟早会漏。
+//
+// 解法：把「库内生成且已校验」的值用**具名类型**表达，使安全性成为类型事实：
+//   - cellRef：经 newCellRef 规范化（校验 A1 形式）的单元格坐标；
+//   - relID：库内生成的关系 ID（rIdN）；
+//   - xmlFrag：仅由字面量与 safe* 拼成的 XML 片段。
+// 这三种类型在护栏里天然"不带污"，无需任何豁免；
+// 反之，裸 string 参数默认带污，漏转义会立刻被检出。
+
+// cellRef 是已规范化的单元格坐标（如 "A1"、"BC12"）。
+// 只能由 newCellRef / parseCellRef 构造，构造时即完成校验。
+type cellRef string
+
+// newCellRef 校验并规范化单元格坐标；非法返回空串。
+// 校验复用 parseCellRef 的正则（^([A-Za-z]+)(\d+)$），保证与既有解析一致。
+func newCellRef(s string) cellRef {
+	if _, _, err := parseCellRef(s); err != nil {
+		return ""
+	}
+	return cellRef(strings.ToUpper(strings.TrimSpace(s)))
+}
+
+// relID 是库内生成的关系 ID（形如 "rId7"），不含用户数据。
+type relID string
+
+// newRelID 由计数器生成关系 ID。
+func newRelID(n int) relID { return relID("rId" + strconv.Itoa(n)) }
+
+// xmlFrag 是「仅由字面量与 safe* 拼成」的 XML 片段，构造即安全。
+// 用它包裹已清洗的片段，让护栏无需把局部中间量当作污点。
+type xmlFrag string
+
+// frag 标记一个已清洗的 XML 片段（调用方负责确保其内部已 safe* 处理）。
+func frag(s string) xmlFrag { return xmlFrag(s) }
+
+// xmlTagName 是「受信任的 schema 标签名」——库内固定字面量（如 "v"、"f"、"r"），
+// 不接受外部输入。用于 XML 正则拼接（非输出），故与认证类型一并纳入护栏白名单。
+type xmlTagName string
+
+// tagName 标记一个受信任的标签名常量。
+func tagName(s string) xmlTagName { return xmlTagName(s) }
+
+// newRelIDFrom 把既有关系 ID 字符串包装为认证的 relID。
+// 仅供库内已生成 rIdN 的场景复用（如 drawing 内部关系）。
+func newRelIDFrom(s string) relID { return relID(s) }
+
+// rangeRef 是已校验的区域引用（如 "A1:C10"）。只能由 newRangeRef 构造，
+// 构造时即完成合法性校验，故可安全写入 XML 属性。
+type rangeRef string
+
+// newRangeRef 校验并规范化区域引用；非法返回空串。
+// 接受 "A1" / "A1:C10" / "A:C" / "1:1" 四种形态。
+func newRangeRef(s string) rangeRef {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	for _, part := range strings.Split(s, ":") {
+		if !isValidRangePart(part) {
+			return ""
+		}
+	}
+	return rangeRef(s)
+}
+
+// isValidRangePart 校验区域引用的单段（列/行/单元格三者之一）。
+func isValidRangePart(p string) bool {
+	if p == "" {
+		return false
+	}
+	i := 0
+	for i < len(p) && p[i] >= 'A' && p[i] <= 'Z' {
+		i++
+	}
+	if i == len(p) {
+		return i <= 3 // 纯列引用 A / AB
+	}
+	if i > 3 || i == 0 {
+		return false
+	}
+	rest := p[i:]
+	allDigits := true
+	for j := 0; j < len(rest); j++ {
+		if rest[j] < '0' || rest[j] > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if !allDigits {
+		// 允许 $ 绝对引用前缀
+		rest = strings.TrimPrefix(rest, "$")
+		if rest == "" {
+			return false
+		}
+		for j := 0; j < len(rest); j++ {
+			if rest[j] < '0' || rest[j] > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// partXML 表示「xlsx 部件的原始 XML 字节」（worksheet / workbook / comments 等）。
+//
+// 它与 xmlFrag 的区别：
+//   - xmlFrag 是**本次新建**的片段（内容全部经过 safe* 处理）；
+//   - partXML 是**文件里已有**的字节，来源是解析其它部件或用户文件。
+//
+// 之所以单独建类型：把既有 XML 重新拼接（如 `ws[:i] + frag + ws[i:]`）是"读取后复用"，
+// 与"把用户数据写进 XML"性质不同 —— 两侧既有内容都未被改写。类型化后护栏无需
+// 任何按变量名的判断即可区分二者。
+type partXML string
+
+// part 把既有部件 XML 标记为 partXML（不改变内容）。
+func part(s string) partXML { return partXML(s) }
+
+// ---------- 日期时间写入 ----------
+
+// excelDateBase 是 Excel 1900 日期系统的基准日。
+//
+// 之所以是 1899-12-30 而不是 1 月 1 日：Excel 为了兼容早期 Lotus 1-2-3
+// 保留了一个并不存在的 1900-02-29（伪闰日），序列号整体比真实日历多 1 天。
+// 基准取 1899-12-30 正好绕开这个偏差。
+var excelDateBase = time.Date(1899, 12, 30, 0, 0, 0, 0, time.UTC)
+
+// timeToExcelSerial 把 time.Time 转成 Excel 序列号（小数为当天的时间占比）。
+//
+// 算法必须与 serialToTime（读侧）**严格互逆**，否则往返会差几百纳秒：
+//序列号是 float64（约 15-16 位有效数字），乘 86400 会放大尾数误差。
+// 早期两侧各写一套（写侧 d.Hours()/24，读侧 serial*86400*1e9），
+// 23:59:59 往返后会变成 23:59:59.000000512。
+//
+// 现在两侧统一为"整数秒 + 小数秒"的分解：
+//   写：(总秒 + 纳秒/1e9) / 86400
+//   读：序列号 * 86400 拆成整数秒与小数秒，再合成 Duration
+func timeToExcelSerial(t time.Time) float64 {
+	d := t.UTC().Sub(excelDateBase)
+	secs := float64(int64(d/time.Second)) + float64(d%time.Second)/1e9
+	return secs / 86400
+}
+
+// SetCellTime 写入日期时间单元格（自动配上日期格式，否则 Excel 里显示为数字）。
+//
+// 格式选择：
+//   - 含时分秒 → "yyyy-mm-dd hh:mm:ss"
+//   - 含时分   → "yyyy-mm-dd hh:mm"
+//   - 仅日期   → "yyyy-mm-dd"
+//
+// 保留原单元格的其它样式（字体、边框等），只覆盖数字格式。
+func (s *WorkSheet) SetCellTime(ref string, t time.Time) error {
+	if err := s.SetCellNumeric(ref, timeToExcelSerial(t)); err != nil {
+		return err
+	}
+	code := "yyyy-mm-dd"
+	switch {
+	case t.Hour() != 0 || t.Minute() != 0 || t.Second() != 0:
+		code = "yyyy-mm-dd hh:mm:ss"
+	case t.Hour() != 0 || t.Minute() != 0:
+		code = "yyyy-mm-dd hh:mm"
+	}
+	// 只设数字格式：读回 GetStyle 拿到全量样式后改 NumFmt 再写回，
+	// 避免覆盖字体/边框等调用方已设的属性。
+	st, err := s.GetStyle(ref)
+	if err != nil {
+		return err
+	}
+	st.NumFmt = code
+	_, err = s.SetStyle(ref, st)
+	return err
+}
+
+// SetCellTime 写入日期时间单元格（包级 API）。
+func SetCellTime(filename, sheetRef, cell string, t time.Time) error {
+	return withSheet(filename, sheetRef, func(s *WorkSheet) error {
+		return s.SetCellTime(cell, t)
+	})
 }

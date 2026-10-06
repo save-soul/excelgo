@@ -116,6 +116,10 @@ func NewSheet(filename, name string) (int, error) {
 // newSheetInMap 在内存 fileMap 上新建名为 name 的空白工作表（不复写磁盘）。
 // 返回新 worksheet 的 zip 内路径与 1 基序号。同名自动追加后缀避让。
 func newSheetInMap(fileMap map[string][]byte, name string) (file string, idx int, err error) {
+	// 新建工作表的统一入口（AddSheet / NewSheet 均走此处），在此集中校验表名
+	if err := validateSheetName(name); err != nil {
+		return "", 0, err
+	}
 	wb := &Workbook{}
 	if err := getXMLFromMap(fileMap, "xl/workbook.xml", wb); err != nil {
 		return "", 0, err
@@ -380,6 +384,10 @@ func MoveSheet(filename, sheetRef string, toIndex int) error {
 // RenameSheet 把名为 oldName 的工作表改名为 newName。workbook.xml 的 <sheet name="...">
 // 是唯一需要修改处；若同名则追加后缀避让。其他内容不受影响。
 func RenameSheet(filename, oldName, newName string) error {
+	// 与 (*Book).RenameSheet 保持一致地校验表名（31 字符上限 / 非法字符）
+	if err := validateSheetName(newName); err != nil {
+		return err
+	}
 	fileMap, err := readZipToMap(filename)
 	if err != nil {
 		return err
@@ -398,26 +406,41 @@ func RenameSheet(filename, oldName, newName string) error {
 	if !found {
 		return fmt.Errorf("找不到名为 %q 的工作表", oldName)
 	}
-	// 避让同名
+	// 避让同名：逐个加序号，而非固定后缀（固定 "_ren" 遇同名会死循环）
 	finalNew := newName
-	for {
-		clash := false
-		for _, s := range wb.Sheets.Sheet {
-			if s.Name == finalNew {
-				clash = true
-				break
-			}
-		}
-		if !clash {
-			break
-		}
-		finalNew = newName + "_ren"
+	for i := 1; indexOfSheetName(wb.Sheets.Sheet, finalNew) >= 0; i++ {
+		finalNew = fmt.Sprintf("%s_%d", newName, i)
+	}
+	if err := validateSheetName(finalNew); err != nil {
+		return err
 	}
 	fileMap["xl/workbook.xml"] = renameSheetInWorkbookXML(fileMap["xl/workbook.xml"], oldName, finalNew)
 	if err := writeMapToZip(filename, fileMap); err != nil {
 		return err
 	}
 	return nil
+}
+
+// SetSheetVisible 设置 filename 中 sheetRef 工作表的可见性状态（见 Book.SetSheetVisible）。
+// state 取 SheetStateVisible / SheetStateHidden / SheetStateVeryHidden。
+func SetSheetVisible(filename, sheetRef, state string) error {
+	b, err := Open(filename)
+	if err != nil {
+		return err
+	}
+	if err := b.SetSheetVisible(sheetRef, state); err != nil {
+		return err
+	}
+	return b.Save()
+}
+
+// GetSheetVisible 读取 filename 中 sheetRef 工作表的可见性状态。
+func GetSheetVisible(filename, sheetRef string) (string, error) {
+	b, err := Open(filename)
+	if err != nil {
+		return "", err
+	}
+	return b.GetSheetVisible(sheetRef)
 }
 
 // ---------- workbook.xml 字节层操作 ----------
@@ -436,21 +459,37 @@ func removeRelationshipFromRels(relsXML []byte, rid string) []byte {
 	return []byte(re.ReplaceAllString(content, ""))
 }
 
-// reindexDefinedNamesAfterDelete 在删除序号为 delIdx（0 基）的工作表后，
-// 把打印区域 definedName 中 localSheetId > delIdx 的全部减 1，保持引用正确。
+// reindexDefinedNamesAfterDelete 在删除序号为 delIdx（0 基）的工作表后，修正所有表级
+// （带 localSheetId）命名区域的引用，保持引用正确：
+//   - 属于被删表的（localSheetId==delIdx，如该表专属的 _xlnm.Print_Area / _xlnm.Print_Titles
+//     及用户自建的表级命名区域）直接移除；
+//   - localSheetId>delIdx 的全部减 1（删除后其余表序号前移）；
+//   - 工作簿级（无 localSheetId）命名区域不受影响。
 func reindexDefinedNamesAfterDelete(wbXML []byte, delIdx int) []byte {
 	content := string(wbXML)
-	re := regexp.MustCompile(`(?s)<definedName\s+name="_xlnm\.Print_Area"\s+localSheetId="(\d+)"([^>]*)>([^<]*)</definedName>`)
+	re := regexp.MustCompile(`(?s)<definedName\b([^>]*)>(.*?)</definedName>`)
 	out := re.ReplaceAllStringFunc(content, func(m string) string {
 		sub := re.FindStringSubmatch(m)
 		if sub == nil {
 			return m
 		}
-		id, _ := strconv.Atoi(sub[1])
+		attrs := sub[1]
+		inner := sub[2]
+		// 仅处理带 localSheetId 的表级命名区域
+		lsRe := regexp.MustCompile(`localSheetId="(\d+)"`)
+		lsM := lsRe.FindStringSubmatch(attrs)
+		if lsM == nil {
+			return m
+		}
+		id, _ := strconv.Atoi(lsM[1])
+		if id == delIdx {
+			return "" // 属于被删表，移除该命名区域（含其打印区域/重复打印标题）
+		}
 		if id > delIdx {
 			id--
 		}
-		return fmt.Sprintf(`<definedName name="_xlnm.Print_Area" localSheetId="%d"%s>%s</definedName>`, id, sub[2], sub[3])
+		newAttrs := lsRe.ReplaceAllString(attrs, fmt.Sprintf(`localSheetId="%d"`, id))
+		return fmt.Sprintf(`<definedName%s>%s</definedName>`, newAttrs, inner)
 	})
 	return []byte(out)
 }
@@ -475,10 +514,12 @@ func moveSheetInWorkbookXML(wbXML []byte, fromIdx, toIdx int) []byte {
 }
 
 // renameSheetInWorkbookXML 把 <sheet name="oldName"> 改为新名。
+// oldName/newName 都是「用户视角」的原始表名；匹配与写入时都必须做 XML 属性转义，
+// 否则表名含 & < > " 时会因文件里存的是 A&amp;B 而匹配不到 A&B，导致重命名静默失效。
 func renameSheetInWorkbookXML(wbXML []byte, oldName, newName string) []byte {
 	content := string(wbXML)
-	re := regexp.MustCompile(`(<sheet\b[^>]*\bname=")(` + regexp.QuoteMeta(oldName) + `)(")`)
-	return []byte(re.ReplaceAllString(content, `${1}`+escapeAttr(newName)+`${3}`))
+	re := regexp.MustCompile(`(<sheet\b[^>]*\bname=")(` + regexp.QuoteMeta(safeAttr(oldName)) + `)(")`)
+	return []byte(re.ReplaceAllString(content, `${1}`+safeAttr(newName)+`${3}`))
 }
 
 // ---------- sheet 标签提取/重建 ----------

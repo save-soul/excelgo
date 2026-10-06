@@ -30,12 +30,19 @@ func TestMergeWorkbook(t *testing.T) {
 	if err := copyFile(target, out); err != nil {
 		t.Fatalf("copy target: %v", err)
 	}
-	err := MergeWorkbook(out, []SourceRef{
+	b, err := Open(out)
+	if err != nil {
+		t.Fatalf("open target: %v", err)
+	}
+	err = b.Merge([]SourceRef{
 		{Workbook: src1, Sheet: "数据A"},
 		{Workbook: src2, Sheet: "数据B"},
 	})
 	if err != nil {
-		t.Fatalf("MergeWorkbook failed: %v", err)
+		t.Fatalf("Merge failed: %v", err)
+	}
+	if err := b.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
 	}
 
 	// 1. 文件存在
@@ -60,10 +67,7 @@ func TestMergeWorkbook(t *testing.T) {
 			hasStyles = true
 		case f.Name == "xl/workbook.xml":
 			hasWorkbook = true
-			rc, _ := f.Open()
-			data, _ := readAll(rc)
-			rc.Close()
-			definedNames = string(data)
+			definedNames = readAllFromZip(f)
 		case strings.HasPrefix(f.Name, "xl/media/"):
 			mediaCount++
 		case strings.HasPrefix(f.Name, "xl/worksheets/sheet") && strings.HasSuffix(f.Name, ".xml"):
@@ -111,24 +115,6 @@ func copyFile(src, dst string) error {
 }
 
 // readAll 读取 ReadCloser 全部内容。
-func readAll(rc interface {
-	Read([]byte) (int, error)
-	Close() error
-}) ([]byte, error) {
-	var buf []byte
-	tmp := make([]byte, 4096)
-	for {
-		n, err := rc.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-		}
-		if err != nil {
-			break
-		}
-	}
-	return buf, nil
-}
-
 func findAll(s, sub string) []string {
 	var out []string
 	for i := 0; ; {
@@ -149,4 +135,78 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// TestMergeWorkbookSharedStrings 回归测试：真实 Excel/WPS 文件使用共享字符串（t="s"），
+// 而本库自身以 inlineStr 写单元格。合并时必须把源表的 t="s" 单元格转成 t="inlineStr"
+// 并内联文本，否则合并后的工作表会引用目标工作簿缺失/不一致的 sharedStrings.xml，
+// 导致 Excel 打开报错或字符串串文。
+func TestMergeWorkbookSharedStrings(t *testing.T) {
+	fixture := filepath.Join("testfixtures", "target.xlsx")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("跳过：缺少样本 %s", fixture)
+	}
+
+	// 以 fixture 为底本构造一个含共享字符串单元格的源工作簿
+	srcMap, err := readZipToMap(fixture)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	ws := string(srcMap["xl/worksheets/sheet1.xml"])
+	ws = strings.Replace(ws, "</sheetData>",
+		`<c r="Z1" t="s" s="0"><v>0</v></c></sheetData>`, 1)
+	srcMap["xl/worksheets/sheet1.xml"] = []byte(ws)
+	srcMap["xl/sharedStrings.xml"] = []byte(
+		`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+			`<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">` +
+			`<si><t xml:space="preserve">共享字符串内容</t></si></sst>`)
+
+	srcPath := filepath.Join(t.TempDir(), "src.xlsx")
+	if err := writeMapToZip(srcPath, srcMap); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	dstPath := filepath.Join(t.TempDir(), "dst.xlsx")
+	if err := copyFile(fixture, dstPath); err != nil {
+		t.Fatalf("copy dst: %v", err)
+	}
+
+	b, err := Open(dstPath)
+	if err != nil {
+		t.Fatalf("open dst: %v", err)
+	}
+	if err := b.Merge([]SourceRef{{Workbook: srcPath, Sheet: "Sheet1"}}); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if err := b.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// 校验：输出中 Z1 单元格须为 inlineStr 且内联了正确文本，不再依赖 sharedStrings
+	outMap, err := readZipToMap(dstPath)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	found := false
+	for name, data := range outMap {
+		if !strings.HasPrefix(name, "xl/worksheets/sheet") {
+			continue
+		}
+		s := string(data)
+		if strings.Contains(s, `r="Z1"`) {
+			found = true
+			if strings.Contains(s, `t="s"`) {
+				t.Errorf("%s 中 Z1 仍为 t=\"s\"（未转换为 inlineStr）:\n%s", name, s)
+			}
+			if !strings.Contains(s, `t="inlineStr"`) {
+				t.Errorf("%s 中 Z1 缺少 t=\"inlineStr\"", name)
+			}
+			if !strings.Contains(s, "共享字符串内容") {
+				t.Errorf("%s 中 Z1 文本丢失", name)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("输出中未找到 Z1（合并表缺失）")
+	}
 }

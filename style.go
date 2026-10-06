@@ -7,7 +7,7 @@ package excelgo
 // 再把目标单元格的 s 属性设为该索引（保留其余属性与数据）。
 //
 // 复用了 styles.go 中的正则块操作原语（extractBlock / extractItems / attrOf / eqElem /
-// xfKey / buildXF / replaceBlockText / ensureStyleSheetNS / escapeAttr），因此同样不破坏
+// xfKey / buildXF / replaceBlockText / ensureStyleSheetNS / safeAttr），因此同样不破坏
 // styles.xml 其他既有内容。
 
 import (
@@ -77,6 +77,9 @@ type Style struct {
 	Border    *BorderStyle
 	Alignment *AlignmentStyle
 	NumFmt    string // 数字格式代码（如 "0.00"、"yyyy-mm-dd"、"0.00%"），空=常规
+	// NumFmtId 为该格式对应的 numFmtId（读取样式时填充）。
+	// GetTime 依此判定是否为日期格式，比仅凭 NumFmt 文本更可靠。
+	NumFmtId int
 }
 
 // ---------- 元素构造 ----------
@@ -91,7 +94,7 @@ func buildFont(f *FontStyle) string {
 		b.WriteString("<i/>")
 	}
 	if f.Underline != "" {
-		b.WriteString(`<u val="` + escapeAttr(f.Underline) + `"/>`)
+		b.WriteString(`<u val="` + safeAttr(f.Underline) + `"/>`)
 	}
 	if f.Strike {
 		b.WriteString("<strike/>")
@@ -102,13 +105,39 @@ func buildFont(f *FontStyle) string {
 		b.WriteString(`<sz val="11"/>`)
 	}
 	if f.Color != "" {
-		b.WriteString(`<color rgb="` + escapeAttr(f.Color) + `"/>`)
+		b.WriteString(`<color rgb="` + safeAttr(f.Color) + `"/>`)
 	}
 	if f.Name != "" {
-		b.WriteString(`<name val="` + escapeAttr(f.Name) + `"/>`)
+		b.WriteString(`<name val="` + safeAttr(f.Name) + `"/>`)
 	}
 	b.WriteString("</font>")
 	return b.String()
+}
+
+// validPatternTypes 是 OOXML 规范（ST_PatternType）认可的填充图案。
+// 取值域来自 openpyxl 的严格校验集（该库会拒绝域外取值，导致工作簿无法加载）。
+var validPatternTypes = map[string]bool{
+	"none": true, "solid": true, "darkDown": true, "darkGray": true,
+	"darkGrid": true, "darkHorizontal": true, "darkTrellis": true,
+	"darkUp": true, "darkVertical": true, "gray0625": true, "gray125": true,
+	"lightDown": true, "lightGray": true, "lightGrid": true,
+	"lightHorizontal": true, "lightTrellis": true, "lightUp": true,
+	"lightVertical": true, "mediumGray": true,
+}
+
+// validatePatternType 校验填充图案类型，返回可直接写入 XML 的安全取值。
+// 该值原样写入 patternType 属性，域外取值会让 openpyxl/Excel 拒绝加载工作簿。
+func validatePatternType(pt string) (string, error) {
+	if pt == "" {
+		return "solid", nil
+	}
+	if !validPatternTypes[pt] {
+		return "", fmt.Errorf("无效的填充图案 %q，合法的 OOXML 取值如："+
+			"solid / none / gray125 / darkGray / lightGray / mediumGray / "+
+			"darkGrid / lightGrid / darkTrellis / lightTrellis"+
+			"（写错会导致 openpyxl/Excel 拒绝加载工作簿）", pt)
+	}
+	return pt, nil
 }
 
 func buildFill(f *FillStyle) string {
@@ -116,8 +145,8 @@ func buildFill(f *FillStyle) string {
 	if pt == "" {
 		pt = "solid"
 	}
-	return `<fill><patternFill patternType="` + escapeAttr(pt) + `">` +
-		`<fgColor rgb="` + escapeAttr(f.Color) + `"/>` +
+	return `<fill><patternFill patternType="` + safeAttr(pt) + `">` +
+		`<fgColor rgb="` + safeAttr(f.Color) + `"/>` +
 		`<bgColor indexed="64"/>` +
 		`</patternFill></fill>`
 }
@@ -134,22 +163,22 @@ func buildBorder(b *BorderStyle) string {
 	return sb.String()
 }
 
-func writeBorderSide(sb *strings.Builder, name string, side BorderSide) {
+func writeBorderSide(sb *strings.Builder, name borderSideName, side BorderSide) {
 	if side.Style == "" {
-		sb.WriteString("<" + name + "/>")
+		sb.WriteString("<" + string(name) + "/>")
 		return
 	}
-	sb.WriteString("<" + name + ` style="` + escapeAttr(side.Style) + `">`)
+	sb.WriteString("<" + string(name) + ` style="` + safeAttr(side.Style) + `">`)
 	if side.Color != "" {
-		sb.WriteString(`<color rgb="` + escapeAttr(side.Color) + `"/>`)
+		sb.WriteString(`<color rgb="` + safeAttr(side.Color) + `"/>`)
 	}
-	sb.WriteString("</" + name + ">")
+	sb.WriteString("</" + string(name) + ">")
 }
 
-func buildXFForStyle(s Style, fontId, fillId, borderId, numFmtId string) string {
+func buildXFForStyle(s Style, fontId, fillId, borderId, numFmtId styleIndex) string {
 	var b strings.Builder
-	b.WriteString(`<xf numFmtId="` + numFmtId + `" fontId="` + fontId + `" fillId="` + fillId +
-		`" borderId="` + borderId + `" xfId="0"`)
+	b.WriteString(`<xf numFmtId="` + string(numFmtId) + `" fontId="` + string(fontId) +
+		`" fillId="` + string(fillId) + `" borderId="` + string(borderId) + `" xfId="0"`)
 	b.WriteString(` applyFont="1" applyFill="1" applyBorder="1" applyNumberFormat="1"`)
 	if s.Alignment != nil {
 		b.WriteString(` applyAlignment="1"`)
@@ -158,10 +187,10 @@ func buildXFForStyle(s Style, fontId, fillId, borderId, numFmtId string) string 
 		var ab strings.Builder
 		ab.WriteString("<alignment")
 		if s.Alignment.Horizontal != "" {
-			ab.WriteString(` horizontal="` + escapeAttr(s.Alignment.Horizontal) + `"`)
+			ab.WriteString(` horizontal="` + safeAttr(s.Alignment.Horizontal) + `"`)
 		}
 		if s.Alignment.Vertical != "" {
-			ab.WriteString(` vertical="` + escapeAttr(s.Alignment.Vertical) + `"`)
+			ab.WriteString(` vertical="` + safeAttr(s.Alignment.Vertical) + `"`)
 		}
 		if s.Alignment.WrapText {
 			ab.WriteString(` wrapText="1"`)
@@ -186,6 +215,11 @@ type styleBuilder struct {
 
 // applyStyleToStylesXML 在已有 styles.xml 字节上应用样式 s，返回新字节与新 cellXf 索引。
 func applyStyleToStylesXML(stylesXML []byte, s Style) ([]byte, int, error) {
+	// 枚举型字段（填充图案/下划线/边框线型/对齐）原样写入 XML，域外取值会让
+	// 消费方拒绝加载工作簿，必须在写入前拦截
+	if err := validateStyleEnums(s); err != nil {
+		return nil, 0, err
+	}
 	b := &styleBuilder{
 		fonts:   extractItems(extractBlock(string(stylesXML), "fonts"), "font"),
 		fills:   extractItems(extractBlock(string(stylesXML), "fills"), "fill"),
@@ -219,7 +253,14 @@ func applyStyleToStylesXML(stylesXML []byte, s Style) ([]byte, int, error) {
 	}
 	fillId := "0"
 	if s.Fill != nil && s.Fill.Color != "" {
-		fillId = itoa(ensureItem(&b.fills, buildFill(s.Fill)))
+		// 图案类型是原样写入 XML 的枚举值，域外取值会让消费方拒绝加载工作簿
+		cp := *s.Fill
+		pt, err := validatePatternType(cp.PatternType)
+		if err != nil {
+			return nil, 0, err
+		}
+		cp.PatternType = pt
+		fillId = itoa(ensureItem(&b.fills, buildFill(&cp)))
 	}
 	borderId := "0"
 	if !s.Border.isEmpty() {
@@ -235,7 +276,7 @@ func applyStyleToStylesXML(stylesXML []byte, s Style) ([]byte, int, error) {
 	}
 
 	// 生成 cellXf，去重后返回索引
-	newXF := buildXFForStyle(s, fontId, fillId, borderId, numFmtId)
+	newXF := buildXFForStyle(s, idx(fontId), idx(fillId), idx(borderId), idx(numFmtId))
 	if idx, ok := findEqualXF(b.cellXfs, newXF); ok {
 		return rebuildStyles(stylesXML, b), idx, nil
 	}
@@ -267,7 +308,7 @@ func (b *styleBuilder) ensureNumFmt(code string) (string, error) {
 	for b.hasNumFmtID(itoa(id)) {
 		id++
 	}
-	b.numFmts = append(b.numFmts, `<numFmt numFmtId="`+itoa(id)+`" formatCode="`+escapeAttr(code)+`"/>`)
+	b.numFmts = append(b.numFmts, `<numFmt numFmtId="`+itoa(id)+`" formatCode="`+safeAttr(code)+`"/>`)
 	return itoa(id), nil
 }
 
@@ -306,13 +347,13 @@ func rebuildStyles(stylesXML []byte, b *styleBuilder) []byte {
 }
 
 // upsertBlock 若 styles 含该块则替换；否则插入到 <fonts> 之前（保持 OOXML 子元素合法顺序）。
-func upsertBlock(styles, tag string, items []string, itemTag string, makeOpen func(int) string) string {
+func upsertBlock(styles string, tag xmlTagName, items []string, itemTag xmlTagName, makeOpen func(int) string) string {
 	block := extractBlock(styles, tag)
 	body := makeOpen(len(items))
 	for _, it := range items {
 		body += it
 	}
-	body += `</` + tag + `>`
+	body += `</` + string(tag) + `>`
 	if block == "" {
 		anchor := "<fonts>"
 		idx := strings.Index(styles, anchor)
@@ -421,7 +462,9 @@ func setStyleRangeInMap(fileMap map[string][]byte, file, rangeRef string, s Styl
 	for row := r1; row <= r2; row++ {
 		for col := c1; col <= c2; col++ {
 			cellRef := colNumToLetters(col) + strconv.Itoa(row+1)
-			setCellStyleAttrInMap(fileMap, file, cellRef, idx)
+			if err := setCellStyleAttrInMap(fileMap, file, cellRef, idx); err != nil {
+				return 0, err
+			}
 		}
 	}
 	return idx, nil
@@ -429,7 +472,13 @@ func setStyleRangeInMap(fileMap map[string][]byte, file, rangeRef string, s Styl
 
 // setCellStyleAttrInMap 在内存 map 上把 cell 的 s 属性设为 sIndex（保留其它属性/数据）。
 // 单元格不存在则创建（仅带 s 索引、空值）。
-func setCellStyleAttrInMap(fileMap map[string][]byte, file, cell string, sIndex int) {
+func setCellStyleAttrInMap(fileMap map[string][]byte, file, cell string, sIndex int) error {
+	// 单元格坐标先校验规范化：非法坐标直接拒绝，不写入 XML
+	cref := newCellRef(cell)
+	if cref == "" {
+		return fmt.Errorf("无效的单元格引用: %q", cell)
+	}
+	cell = string(cref)
 	ws := string(fileMap[file])
 	sAttr := fmt.Sprintf(` s="%d"`, sIndex)
 	re := regexp.MustCompile(`(?s)<c\b[^>]*\br="` + regexp.QuoteMeta(cell) + `"[^>]*/?>(?:.*?</c>)?`)
@@ -441,10 +490,127 @@ func setCellStyleAttrInMap(fileMap map[string][]byte, file, cell string, sIndex 
 	} else {
 		_, rowNum, err := parseCellRef(cell)
 		if err != nil {
-			rowNum = 0
+			return err
 		}
 		newCell := injectSAttr(`<c r="`+cell+`"/>`, sAttr)
-		ws = insertCellIntoRow(ws, rowNum+1, newCell)
+		ws = insertCellIntoRow(part(ws), rowNum+1, frag(newCell))
 	}
 	fileMap[file] = []byte(ws)
+	return nil
+}
+
+// styleIndex 表示 styles.xml 中的样式索引（fontId/fillId/borderId/numFmtId）。
+// 由库内 buildStyles 递增生成，不含用户数据；写入 XML 属性时无需转义。
+type styleIndex string
+
+// idx 标记一个样式索引值。
+func idx(s string) styleIndex { return styleIndex(s) }
+
+// borderSideName 表示边框的边名常量（left/right/top/bottom/diagonal），
+// 来自库内固定集合，非用户输入。
+type borderSideName string
+
+// ---------- 样式枚举值的合法性校验 ----------
+//
+// 下面这些属性都是**原样写入 XML 的枚举值**，不是自由文本。域外取值不会被
+// 转义拦住，而是会让消费方直接拒绝加载整个工作簿（openpyxl 对每类都有严格
+// 白名单，Excel 同样判损坏）。因此必须在写入前拦截。
+
+// validUnderlines 是 OOXML 规范（ST_UnderlineValues）认可的下划线取值。
+var validUnderlines = map[string]bool{
+	"single": true, "double": true, "singleAccounting": true, "doubleAccounting": true,
+}
+
+// validBorderStyles 是 OOXML 规范（ST_BorderStyle）认可的边框线型。
+var validBorderStyles = map[string]bool{
+	"thin": true, "medium": true, "thick": true, "double": true, "dashed": true,
+	"dotted": true, "thickDashDot": true, "dashDot": true, "dashDotDot": true,
+	"mediumDashDot": true, "mediumDashDotDot": true, "mediumUpDash": true,
+	"hair": true, "mediumDashed": true, "dashDotStroked": true, "slantDashDot": true,
+	"none": true,
+}
+
+// validHorizontals 是 OOXML 规范（ST_HorizontalAlignment）认可的水平对齐取值。
+var validHorizontals = map[string]bool{
+	"left": true, "center": true, "right": true, "general": true,
+	"fill": true, "justify": true, "centerContinuous": true, "distributed": true,
+}
+
+// validVerticals 是 OOXML 规范（ST_VerticalAlignment）认可��垂直对齐取值。
+var validVerticals = map[string]bool{
+	"top": true, "center": true, "bottom": true, "justify": true, "distributed": true,
+}
+
+// validateUnderline 校验下划线取值（空串表示无下划线，合法）。
+func validateUnderline(u string) error {
+	if u == "" || validUnderlines[u] {
+		return nil
+	}
+	return fmt.Errorf("无效的下划线类型 %q，合法的 OOXML 取值：single / double / "+
+		"singleAccounting / doubleAccounting（写错会导致 openpyxl/Excel 拒绝加载工作簿）", u)
+}
+
+// validateBorderStyle 校验边框线型（空串表示无边框，合法）。
+func validateBorderStyle(s string) error {
+	if s == "" || validBorderStyles[s] {
+		return nil
+	}
+	return fmt.Errorf("无效的边框线型 %q，合法的 OOXML 取值如：thin / medium / thick / "+
+		"double / dashed / dotted / hair（写错会导致 openpyxl/Excel 拒绝加载工作簿）", s)
+}
+
+// validateAlignment 校验水平与垂直对齐取值（空串表示默认，合法）。
+func validateAlignment(a *AlignmentStyle) error {
+	if a == nil {
+		return nil
+	}
+	if a.Horizontal != "" && !validHorizontals[a.Horizontal] {
+		return fmt.Errorf("无效的水平对齐 %q，合法的 OOXML 取值：left / center / right / "+
+			"general / fill / justify / centerContinuous / distributed", a.Horizontal)
+	}
+	if a.Vertical != "" && !validVerticals[a.Vertical] {
+		return fmt.Errorf("无效的垂直对齐 %q，合法的 OOXML 取值：top / center / bottom / "+
+			"justify / distributed", a.Vertical)
+	}
+	return nil
+}
+
+// validateFont 校验字体里的枚举取值。
+func validateFont(f *FontStyle) error {
+	if f == nil {
+		return nil
+	}
+	return validateUnderline(f.Underline)
+}
+
+// validateBorder 校验边框各边的线型取值。
+func validateBorder(b *BorderStyle) error {
+	if b == nil {
+		return nil
+	}
+	for _, side := range []struct {
+		name  string
+		style string
+	}{
+		{"Left", b.Left.Style}, {"Right", b.Right.Style},
+		{"Top", b.Top.Style}, {"Bottom", b.Bottom.Style},
+		{"Diagonal", b.Diagonal.Style},
+	} {
+		if err := validateBorderStyle(side.style); err != nil {
+			return fmt.Errorf("边框 %s: %w", side.name, err)
+		}
+	}
+	return nil
+}
+
+// validateStyleEnums 一次性校验 Style 里所有枚举型字段。
+// 供所有写入样式的入口调用，避免各路径漏检。
+func validateStyleEnums(s Style) error {
+	if err := validateFont(s.Font); err != nil {
+		return err
+	}
+	if err := validateBorder(s.Border); err != nil {
+		return err
+	}
+	return validateAlignment(s.Alignment)
 }

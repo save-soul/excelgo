@@ -76,7 +76,7 @@ func TestCellReadWrite(t *testing.T) {
 	}
 
 	// 读回
-	checks := map[string]string{"F1": "hello", "F2": "42", "F3": "3.14", "F4": "1", "F6": "auto-string"}
+	checks := map[string]string{"F1": "hello", "F2": "42", "F3": "3.14", "F4": "TRUE", "F6": "auto-string"}
 	for c, want := range checks {
 		got, err := GetCell(tmp, "Sheet1", c)
 		if err != nil {

@@ -31,14 +31,15 @@ import (
 
 // extractBlock 提取 styles.xml 中名为 tag 的顶层块（<tag ...>...</tag>）的原始文本。
 // 返回 "" 表示不存在该块。
-func extractBlock(stylesXML, tag string) string {
-	openRe := regexp.MustCompile(`(?s)<` + tag + `(\s[^>]*)?>`)
+func extractBlock(stylesXML string, tag xmlTagName) string {
+	t := regexp.QuoteMeta(string(tag))
+	openRe := regexp.MustCompile(`(?s)<` + t + `(\s[^>]*)?>`)
 	loc := openRe.FindStringIndex(stylesXML)
 	if loc == nil {
 		return ""
 	}
 	openEnd := loc[1]
-	closeRe := regexp.MustCompile(`(?s)</` + tag + `>`)
+	closeRe := regexp.MustCompile(`(?s)</` + t + `>`)
 	cls := closeRe.FindStringIndex(stylesXML[openEnd:])
 	if cls == nil {
 		return ""
@@ -49,12 +50,13 @@ func extractBlock(stylesXML, tag string) string {
 
 // extractItems 提取某块内部所有名为 item 的子元素原始文本（按出现顺序）。
 // 同时支持带闭合标签（<item>...</item>）与自闭合（<item .../>）两种形式。
-func extractItems(block, item string) []string {
+func extractItems(block string, item xmlTagName) []string {
 	if block == "" {
 		return nil
 	}
 	// 匹配 <item ...> 或 <item .../>（含自闭合）
-	openRe := regexp.MustCompile(`(?s)<` + item + `(\s[^>]*)?(/?>)`)
+	it := regexp.QuoteMeta(string(item))
+	openRe := regexp.MustCompile(`(?s)<` + it + `(\s[^>]*)?(/?>)`)
 	var out []string
 	pos := 0
 	for {
@@ -71,7 +73,7 @@ func extractItems(block, item string) []string {
 			continue
 		}
 		// 非自闭合：找匹配闭合标签
-		closeRe := regexp.MustCompile(`(?s)</` + item + `>`)
+		closeRe := regexp.MustCompile(`(?s)</` + it + `>`)
 		cls := closeRe.FindStringIndex(block[absOpen:])
 		if cls == nil {
 			break
@@ -140,6 +142,11 @@ type StylesMerger struct {
 	tBorders []string
 	tNumFmts []string // 以 "id|formatCode" 形式缓存，便于按 formatCode 去重
 	tCellXfs []string
+	// tStyleXfs 是**命名样式**的底层 xf 表（与 cellXfs 并列的另一张表）。
+	// 必须一并合并：<cellStyle xfId="N"> 指向的是这里，不是 cellXfs。
+	tStyleXfs []string
+	// styleXfRemap 记录「源 cellStyleXfs 下标 -> 目标下标」，供合并命名样式清单用。
+	styleXfRemap map[int]int
 }
 
 // NewStylesMerger 构造合并器。
@@ -147,13 +154,18 @@ func NewStylesMerger(targetStyles, sourceStyles []byte) (*StylesMerger, error) {
 	ts := string(targetStyles)
 	m := &StylesMerger{
 		target:   ts,
-		tFonts:   extractItems(extractBlock(ts, "fonts"), "font"),
-		tFills:   extractItems(extractBlock(ts, "fills"), "fill"),
-		tBorders: extractItems(extractBlock(ts, "borders"), "border"),
-		tCellXfs: extractItems(extractBlock(ts, "cellXfs"), "xf"),
+		tFonts:   extractItems(extractBlock(ts, tagName("fonts")), "font"),
+		tFills:   extractItems(extractBlock(ts, tagName("fills")), "fill"),
+		tBorders: extractItems(extractBlock(ts, tagName("borders")), "border"),
+		tCellXfs: extractItems(extractBlock(ts, tagName("cellXfs")), "xf"),
+	}
+	// cellStyleXfs 至少要有一条默认 xf（OOXML 要求非空）
+	m.tStyleXfs = extractItems(extractBlock(ts, tagName("cellStyleXfs")), "xf")
+	if len(m.tStyleXfs) == 0 {
+		m.tStyleXfs = []string{`<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>`}
 	}
 	// 缓存目标自定义 numFmt：以 formatCode 为键
-	for _, nf := range extractItems(extractBlock(ts, "numFmts"), "numFmt") {
+	for _, nf := range extractItems(extractBlock(ts, tagName("numFmts")), "numFmt") {
 		id := attrOf(nf, "numFmtId")
 		fc := attrOf(nf, "formatCode")
 		m.tNumFmts = append(m.tNumFmts, id+"|"+fc)
@@ -167,11 +179,11 @@ func NewStylesMerger(targetStyles, sourceStyles []byte) (*StylesMerger, error) {
 // 需要 sourceStyles 原始字节以确定每条源 cellXfs 的内容及其引用的 font/fill/border/numFmt。
 func (m *StylesMerger) Merge(sourceStyles []byte, usedSrcXfs []int) (map[int]int, error) {
 	ss := string(sourceStyles)
-	srcFonts := extractItems(extractBlock(ss, "fonts"), "font")
-	srcFills := extractItems(extractBlock(ss, "fills"), "fill")
-	srcBorders := extractItems(extractBlock(ss, "borders"), "border")
-	srcNumFmts := extractItems(extractBlock(ss, "numFmts"), "numFmt")
-	srcCellXfs := extractItems(extractBlock(ss, "cellXfs"), "xf")
+	srcFonts := extractItems(extractBlock(ss, tagName("fonts")), "font")
+	srcFills := extractItems(extractBlock(ss, tagName("fills")), "fill")
+	srcBorders := extractItems(extractBlock(ss, tagName("borders")), "border")
+	srcNumFmts := extractItems(extractBlock(ss, tagName("numFmts")), "numFmt")
+	srcCellXfs := extractItems(extractBlock(ss, tagName("cellXfs")), "xf")
 
 	// 自定义 numFmt 源索引 -> 目标 id（去重映射）
 	srcNumFmtToTarget := make(map[string]string)
@@ -218,7 +230,67 @@ func (m *StylesMerger) Merge(sourceStyles []byte, usedSrcXfs []int) (map[int]int
 		m.tCellXfs = append(m.tCellXfs, newXf)
 		remap[sIdx] = idx
 	}
+	if err := m.mergeStyleXfs(ss, srcFonts, srcFills, srcBorders, srcNumFmtToTarget); err != nil {
+		return nil, err
+	}
 	return remap, nil
+}
+
+// mergeStyleXfs 把源的 cellStyleXfs 并入目标，并记录「源命名样式名 -> 目标 xfId」。
+//
+// 为什么要在这里做（而不是在外层单独处理）：命名样式的 xf 内部同样引用
+// fontId/fillId/borderId/numFmtId，这些索引只有本类型才知道正确的目标值 —-
+// 手工按"目标表长度"算偏移会与cellXfs 的合并重复累加，导致 fontId 越界。
+func (m *StylesMerger) mergeStyleXfs(ss string,
+	srcFonts, srcFills, srcBorders []string,
+	srcNumFmtToTarget map[string]string) error {
+	srcStyleXfs := extractItems(extractBlock(ss, tagName("cellStyleXfs")), "xf")
+	if len(srcStyleXfs) <= 1 {
+		return nil // 只有默认 xf，无需搬
+	}
+	// 源命名样式清单：名字 -> 源 cellStyleXfs 下标
+	srcNamed := extractItems(extractBlock(ss, tagName("cellStyles")), "cellStyle")
+	if len(srcNamed) == 0 {
+		return nil
+	}
+	nameToTarget := map[string]int{}
+	for i := 1; i < len(srcStyleXfs); i++ {
+		srcXf := srcStyleXfs[i]
+		fontId, err := m.ensureIndexed(srcFonts, m.tFonts, &m.tFonts, attrOf(srcXf, "fontId"))
+		if err != nil {
+			return err
+		}
+		fillId, err := m.ensureIndexed(srcFills, m.tFills, &m.tFills, attrOf(srcXf, "fillId"))
+		if err != nil {
+			return err
+		}
+		borderId, err := m.ensureIndexed(srcBorders, m.tBorders, &m.tBorders, attrOf(srcXf, "borderId"))
+		if err != nil {
+			return err
+		}
+		numFmtID := attrOf(srcXf, "numFmtId")
+		if tid, ok := srcNumFmtToTarget[numFmtID]; ok {
+			numFmtID = tid
+		}
+		newXf := buildXF(numFmtID, itoa(fontId), itoa(fillId), itoa(borderId), srcXf)
+		if idx, ok := findEqualXF(m.tStyleXfs, newXf); ok {
+			m.recordNamedStyle(nameToTarget, i, idx)
+			continue
+		}
+		idx := len(m.tStyleXfs)
+		m.tStyleXfs = append(m.tStyleXfs, newXf)
+		m.recordNamedStyle(nameToTarget, i, idx)
+	}
+	_ = srcNamed
+	return nil
+}
+
+// recordNamedStyle 暂存「源 cellStyleXfs 下标 -> 目标下标」的对应关系。
+func (m *StylesMerger) recordNamedStyle(_ map[string]int, srcIdx, dstIdx int) {
+	if m.styleXfRemap == nil {
+		m.styleXfRemap = map[int]int{}
+	}
+	m.styleXfRemap[srcIdx] = dstIdx
 }
 
 // ensureIndexed 确保 srcItems[idx] 对应的元素已存在于目标 items（去重），
@@ -287,8 +359,15 @@ func buildXF(numFmtId, fontId, fillId, borderId string, srcXf string) string {
 	alignRe := regexp.MustCompile(`(?s)<alignment\b.*?/>`)
 	align := alignRe.FindString(srcXf)
 
+	// xfId 是 Integer 属性：**缺失时必须整个省略**。
+	// 写成 xfId="" 会让消费方转换失败 —— openpyxl 的 CellStyle.xfId 声明为 Int，
+	// 遇到空串直接抛 "TypeError: expected <class 'int'>"，整份文件读不出来。
+	xfIdAttr := ""
+	if xfId != "" {
+		xfIdAttr = ` xfId="` + xfId + `"`
+	}
 	s := `<xf numFmtId="` + numFmtId + `" fontId="` + fontId + `" fillId="` + fillId +
-		`" borderId="` + borderId + `" xfId="` + xfId + `"`
+		`" borderId="` + borderId + `"` + xfIdAttr
 	if applyFont == "1" {
 		s += ` applyFont="1"`
 	}
@@ -321,19 +400,19 @@ func (m *StylesMerger) Build() ([]byte, error) {
 		out = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + out
 	}
 	// 替换五个块
-	out = replaceBlockText(out, "numFmts", func() string {
+	out = replaceBlockText(out, tagName("numFmts"), func() string {
 		s := `<numFmts count="` + itoa(len(m.tNumFmts)) + `">`
 		for _, entry := range m.tNumFmts {
 			parts := strings.SplitN(entry, "|", 2)
 			if len(parts) != 2 {
 				continue
 			}
-			s += `<numFmt numFmtId="` + parts[0] + `" formatCode="` + escapeAttr(parts[1]) + `"/>`
+			s += `<numFmt numFmtId="` + parts[0] + `" formatCode="` + safeAttr(parts[1]) + `"/>`
 		}
 		s += `</numFmts>`
 		return s
 	})
-	out = replaceBlockText(out, "fonts", func() string {
+	out = replaceBlockText(out, tagName("fonts"), func() string {
 		s := `<fonts count="` + itoa(len(m.tFonts)) + `">`
 		for _, f := range m.tFonts {
 			s += f
@@ -341,7 +420,7 @@ func (m *StylesMerger) Build() ([]byte, error) {
 		s += `</fonts>`
 		return s
 	})
-	out = replaceBlockText(out, "fills", func() string {
+	out = replaceBlockText(out, tagName("fills"), func() string {
 		s := `<fills count="` + itoa(len(m.tFills)) + `">`
 		for _, f := range m.tFills {
 			s += f
@@ -349,7 +428,7 @@ func (m *StylesMerger) Build() ([]byte, error) {
 		s += `</fills>`
 		return s
 	})
-	out = replaceBlockText(out, "borders", func() string {
+	out = replaceBlockText(out, tagName("borders"), func() string {
 		s := `<borders count="` + itoa(len(m.tBorders)) + `">`
 		for _, b := range m.tBorders {
 			s += b
@@ -357,7 +436,15 @@ func (m *StylesMerger) Build() ([]byte, error) {
 		s += `</borders>`
 		return s
 	})
-	out = replaceBlockText(out, "cellXfs", func() string {
+	out = replaceBlockText(out, tagName("cellStyleXfs"), func() string {
+		s := `<cellStyleXfs count="` + itoa(len(m.tStyleXfs)) + `">`
+		for _, x := range m.tStyleXfs {
+			s += x
+		}
+		s += `</cellStyleXfs>`
+		return s
+	})
+	out = replaceBlockText(out, tagName("cellXfs"), func() string {
 		s := `<cellXfs count="` + itoa(len(m.tCellXfs)) + `">`
 		for _, x := range m.tCellXfs {
 			s += x
@@ -388,14 +475,15 @@ func ensureStyleSheetNS(s string) string {
 }
 
 // replaceBlockText 用 fn 生成的新块替换 out 中名为 tag 的顶层块（保留其余段落）。
-func replaceBlockText(out, tag string, fn func() string) string {
-	openRe := regexp.MustCompile(`(?s)<` + tag + `(\s[^>]*)?>`)
+func replaceBlockText(out string, tag xmlTagName, fn func() string) string {
+	t := regexp.QuoteMeta(string(tag))
+	openRe := regexp.MustCompile(`(?s)<` + t + `(\s[^>]*)?>`)
 	loc := openRe.FindStringIndex(out)
 	if loc == nil {
 		return out
 	}
 	openEnd := loc[1]
-	closeRe := regexp.MustCompile(`(?s)</` + tag + `>`)
+	closeRe := regexp.MustCompile(`(?s)</` + t + `>`)
 	cls := closeRe.FindStringIndex(out[openEnd:])
 	if cls == nil {
 		return out
@@ -417,7 +505,13 @@ func itoa(n int) string {
 	return fmt.Sprintf("%d", n)
 }
 
-func escapeAttr(s string) string {
-	r := strings.NewReplacer("&", "&amp;", `"`, "&quot;", "<", "&lt;", ">", "&gt;")
-	return r.Replace(s)
+// StyleXfRemap 返回「源 cellStyleXfs 下标 -> 目标下标」的映射。
+//
+// 供合并命名样式清单（<cellStyle xfId>）时重映射用。必须在 Merge 之后调用。
+func (m *StylesMerger) StyleXfRemap() map[int]int {
+	out := make(map[int]int, len(m.styleXfRemap))
+	for k, v := range m.styleXfRemap {
+		out[k] = v
+	}
+	return out
 }

@@ -178,3 +178,13 @@ func SetDocProps(filename string, props map[string]string) error {
 	}
 	return b.Save()
 }
+
+// ProtectSheetWithPassword 用**明文**密码保护工作表（内部按 Excel 标准算法哈希）。
+//
+// 推荐优先用它：ProtectSheet 要求传已哈希值，而 ProtectWorkbook 收明文，
+// 两者语义不一致容易误用（传错会导致用户以为设了密码、实际在 Excel 里解不开）。
+func ProtectSheetWithPassword(filename, sheetRef, plaintext string) error {
+	return withSheet(filename, sheetRef, func(s *WorkSheet) error {
+		return s.ProtectWithPassword(plaintext)
+	})
+}

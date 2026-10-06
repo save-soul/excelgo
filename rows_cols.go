@@ -7,11 +7,12 @@ package excelgo
 //     打印区域 definedName 中的单元格引用），其余 XML 原样保留。
 //   - 单元格 s 样式索引不变；合并单元格、列宽定义、分页符均随位置平移。
 //   - 公式单元格内的 A1 引用字符串不做改写（与 excelize 行为一致，由调用方负责公式修正）。
-//   - 浮动图片锚点（oneCellAnchor/from 的 col/row）不随行列操作平移——图片保持原位，
-//     避免破坏图纸；如需要可另行处理。
+//   - 浮动图片锚点（oneCellAnchor / twoCellAnchor 的 from/to col/row）随行列操作平移，
+//     与 Excel 行为一致；锚点落入被删区间的图片随内容一并移除。
 
 import (
 	"fmt"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,8 +35,55 @@ func colNumToLetters(col int) string {
 	return string(r)
 }
 
+// wsMaxRow 返回工作表中实际出现的最大行号（1 基）；空表返回 0。
+// 同时考虑 <row r=".."> 与单元格的 <c r="A10"> 引用，避免漏判只有单元格没有 row 属性的表。
+func wsMaxRow(ws string) int {
+	max := 0
+	for _, m := range regexp.MustCompile(`<row\b[^>]*\br="(\d+)"`).FindAllStringSubmatch(ws, -1) {
+		if v, err := strconv.Atoi(m[1]); err == nil && v > max {
+			max = v
+		}
+	}
+	for _, m := range regexp.MustCompile(`<c\b[^>]*\br="[A-Za-z]{1,3}(\d+)"`).FindAllStringSubmatch(ws, -1) {
+		if v, err := strconv.Atoi(m[1]); err == nil && v > max {
+			max = v
+		}
+	}
+	return max
+}
+
+// wsMaxCol 返回工作表中实际出现的最大列号（1 基）；空表返回 0。
+// 同时考虑 <col min/max> 定义、单元格 <c r="J1"> 引用与 <row spans> 声明。
+func wsMaxCol(ws string) int {
+	max := 0
+	for _, m := range regexp.MustCompile(`<col\b[^>]*\bmin="(\d+)"[^>]*\bmax="(\d+)"`).FindAllStringSubmatch(ws, -1) {
+		lo, e1 := strconv.Atoi(m[1])
+		hi, e2 := strconv.Atoi(m[2])
+		if e1 == nil && lo > max {
+			max = lo
+		}
+		if e2 == nil && hi > max {
+			max = hi
+		}
+	}
+	for _, m := range regexp.MustCompile(`<c\b[^>]*\br="([A-Za-z]{1,3})(\d+)"`).FindAllStringSubmatch(ws, -1) {
+		if v, err := colLettersToNum(m[1]); err == nil && v > max {
+			max = v
+		}
+	}
+	for _, m := range regexp.MustCompile(`<row\b[^>]*\bspans="(\d+):(\d+)"`).FindAllStringSubmatch(ws, -1) {
+		if v, err := strconv.Atoi(m[2]); err == nil && v > max {
+			max = v
+		}
+	}
+	return max
+}
+
 // InsertRows 在 sheetRef 的第 row 行（1 基）之前插入 n 行（n>=1）。
 // 原有 row 及之后的行整体下移，行内单元格引用（含公式 <f> 内部引用）同步平移，样式不变。
+//
+// row 允许等于「最大行号 + 1」（即在表尾之后追加空行，符合 Excel 行为）；
+// 超过该值则返回错误，避免误填空白导致文件里出现大片无意义空行。
 func InsertRows(filename, sheetRef string, row, n int) error {
 	if row < 1 || n < 1 {
 		return fmt.Errorf("row 须>=1 且 n 须>=1")
@@ -53,6 +101,9 @@ func InsertRows(filename, sheetRef string, row, n int) error {
 		return err
 	}
 	ws := string(fileMap[file])
+	if mr := wsMaxRow(ws); row > mr+1 {
+		return fmt.Errorf("插入行 %d 超出表尾（当前最大行 %d，最多可在 %d 处插入）", row, mr, mr+1)
+	}
 	ws, err = shiftRows(ws, row, n, nil)
 	if err != nil {
 		return err
@@ -60,6 +111,8 @@ func InsertRows(filename, sheetRef string, row, n int) error {
 	// 在 row 位置插入 n 个空 <row>（带 r 属性，保持升序）
 	ws = insertEmptyRows(ws, row, n)
 	fileMap[file] = []byte(ws)
+	// 浮动图片锚点随行下移（与 Excel 行为一致）
+	shiftDrawingAnchorsForSheet(fileMap, file, row, n, nil, true)
 	if err := writeMapToZip(filename, fileMap); err != nil {
 		return err
 	}
@@ -86,6 +139,10 @@ func RemoveRows(filename, sheetRef string, row, n int) error {
 		return err
 	}
 	ws := string(fileMap[file])
+	// 校验删除范围不超出表尾
+	if mr := wsMaxRow(ws); row+n-1 > mr {
+		return fmt.Errorf("删除第 %d~%d 行超出表尾（当前最大行 %d）", row, row+n-1, mr)
+	}
 	// 先删 [row, row+n-1] 的 <row> 块
 	ws = deleteRowRange(ws, row, n)
 	// 后续行 r 减 n，单元格引用行号同步减 n；被删区间内的公式引用转 #REF!
@@ -95,11 +152,16 @@ func RemoveRows(filename, sheetRef string, row, n int) error {
 		return err
 	}
 	fileMap[file] = []byte(ws)
+	// 浮动图片锚点随行上移；落入被删行区间的图片一并移除（与 Excel 行为一致）
+	shiftDrawingAnchorsForSheet(fileMap, file, row, -n, &delRows, true)
 	return writeMapToZip(filename, fileMap)
 }
 
 // InsertCols 在 sheetRef 的第 col 列（1 基）之前插入 n 列（n>=1）。
 // 原有 col 及之后的列整体右移，单元格引用、合并区域、列宽、列分页符同步平移。
+//
+// col 允许等于「最大列号 + 1」（即在表尾之后追加空列，符合 Excel 行为）；
+// 超过该值则返回错误。
 func InsertCols(filename, sheetRef string, col, n int) error {
 	if col < 1 || n < 1 {
 		return fmt.Errorf("col 须>=1 且 n 须>=1")
@@ -117,8 +179,13 @@ func InsertCols(filename, sheetRef string, col, n int) error {
 		return err
 	}
 	ws := string(fileMap[file])
+	if mc := wsMaxCol(ws); col > mc+1 {
+		return fmt.Errorf("插入列 %d 超出表尾（当前最大列 %d，最多可在 %d 处插入）", col, mc, mc+1)
+	}
 	ws = shiftCols(ws, col, n, nil)
 	fileMap[file] = []byte(ws)
+	// 浮动图片锚点随列右移（与 Excel 行为一致）
+	shiftDrawingAnchorsForSheet(fileMap, file, col, n, nil, false)
 	return writeMapToZip(filename, fileMap)
 }
 
@@ -140,9 +207,15 @@ func RemoveCols(filename, sheetRef string, col, n int) error {
 		return err
 	}
 	ws := string(fileMap[file])
+	// 校验删除范围不超出表尾
+	if mc := wsMaxCol(ws); col+n-1 > mc {
+		return fmt.Errorf("删除第 %d~%d 列超出表尾（当前最大列 %d）", col, col+n-1, mc)
+	}
 	delCols := [2]int{col, col + n - 1}
 	ws = shiftCols(ws, col, -n, &delCols)
 	fileMap[file] = []byte(ws)
+	// 浮动图片锚点随列左移；落入被删列区间的图片一并移除（与 Excel 行为一致）
+	shiftDrawingAnchorsForSheet(fileMap, file, col, -n, &delCols, false)
 	return writeMapToZip(filename, fileMap)
 }
 
@@ -463,4 +536,106 @@ func colLettersToNum(s string) (int, error) {
 		n = n*26 + int(ch-'A'+1)
 	}
 	return n, nil
+}
+
+// ---------- 浮动图片锚点平移 ----------
+// Excel 中插入/删除行列时，浮动图片（oneCellAnchor / twoCellAnchor）的锚点随单元格平移，
+// 与单元格逻辑一致；下方函数补齐该平移，使图片保持相对位置、删除时移除落入被删区间的图片。
+
+// sheetDrawingFiles 返回某工作表通过 rels 关联的所有 drawing 文件路径（绝对 zip 路径）。
+func sheetDrawingFiles(fileMap map[string][]byte, sheetFile string) []string {
+	relsFile := "xl/worksheets/_rels/" + path.Base(sheetFile) + ".rels"
+	if !fileExistsInMap(fileMap, relsFile) {
+		return nil
+	}
+	rels := &Relationships{}
+	if err := getXMLFromMap(fileMap, relsFile, rels); err != nil {
+		return nil
+	}
+	var drawings []string
+	for _, rel := range rels.Relationship {
+		if strings.Contains(rel.Type, "/relationships/drawing") {
+			drawings = append(drawings, resolveTarget("xl/worksheets", rel.Target))
+		}
+	}
+	return drawings
+}
+
+// shiftDrawingAnchorsForSheet 平移 sheetFile 关联的所有 drawing 中的浮动图片锚点。
+// pivot 为 1 基行列号，delta 为平移量（插入为正、删除为负），delBand 为被删行列闭区间
+// （仅删除时非 nil）；锚点落入被删区间则移除该图片；isRow=true 平移行锚点，否则平移列锚点。
+func shiftDrawingAnchorsForSheet(fileMap map[string][]byte, sheetFile string, pivot, delta int, delBand *[2]int, isRow bool) {
+	for _, dw := range sheetDrawingFiles(fileMap, sheetFile) {
+		if !fileExistsInMap(fileMap, dw) {
+			continue
+		}
+		fileMap[dw] = []byte(shiftDrawingAnchors(string(fileMap[dw]), pivot, delta, delBand, isRow))
+	}
+}
+
+// drawing 命名空间前缀可变：Excel/WPS 多用 "xdr:oneCellAnchor"，而 excelgo 自己
+// 写出的 drawing 使用默认命名空间（"oneCellAnchor"）。因此所有匹配一律写成
+// `(?:xdr:)?`，两种形式都能命中。
+var (
+	reDrawingAnchor = regexp.MustCompile(`(?s)<(?:xdr:)?(?:oneCellAnchor|twoCellAnchor)\b.*?</(?:xdr:)?(?:oneCellAnchor|twoCellAnchor)>`)
+	reAnchorFrom    = regexp.MustCompile(`(?s)<(?:xdr:)?from\b.*?</(?:xdr:)?from>`)
+	reAnchorBlock   = regexp.MustCompile(`(?s)<(?:xdr:)?(?:from|to)\b.*?</(?:xdr:)?(?:from|to)>`)
+	reAnchorCol     = regexp.MustCompile(`(<(?:xdr:)?col>)(\d+)(</(?:xdr:)?col>)`)
+	reAnchorRow     = regexp.MustCompile(`(<(?:xdr:)?row>)(\d+)(</(?:xdr:)?row>)`)
+)
+
+// shiftDrawingAnchors 平移 drawing XML 中所有 oneCellAnchor/twoCellAnchor 锚点的 col/row。
+func shiftDrawingAnchors(drawingXML string, pivot, delta int, delBand *[2]int, isRow bool) string {
+	return reDrawingAnchor.ReplaceAllStringFunc(drawingXML, func(anchor string) string {
+		// 删除场景：若锚点 from 落入被删区间，移除整个图片锚点
+		if delBand != nil {
+			if fm := reAnchorFrom.FindString(anchor); fm != "" {
+				col, row := anchorColRow(fm)
+				v := col
+				if isRow {
+					v = row
+				}
+				// 锚点为 0 基，转成 1 基与被删闭区间比较
+				if (v+1) >= delBand[0] && (v+1) <= delBand[1] {
+					return ""
+				}
+			}
+		}
+		// 平移 from / to 块
+		return reAnchorBlock.ReplaceAllStringFunc(anchor, func(block string) string {
+			return shiftAnchorBlock(block, pivot, delta, isRow)
+		})
+	})
+}
+
+// anchorColRow 从 <from>...</from> 块中提取 col 与 row（均为 0 基）。
+// 兼容带 "xdr:" 前缀与默认命名空间两种写法。
+func anchorColRow(block string) (col, row int) {
+	if m := reAnchorCol.FindStringSubmatch(block); m != nil {
+		col, _ = strconv.Atoi(m[2])
+	}
+	if m := reAnchorRow.FindStringSubmatch(block); m != nil {
+		row, _ = strconv.Atoi(m[2])
+	}
+	return
+}
+
+// shiftAnchorBlock 平移一个 from/to 块内的 col 或 row（colOff/rowOff 偏移量保持不变）。
+// drawing 锚点的 col/row 为 0 基，而传入的 pivot 为 1 基，故比较时取 v+1。
+func shiftAnchorBlock(block string, pivot, delta int, isRow bool) string {
+	re := reAnchorRow
+	if !isRow {
+		re = reAnchorCol
+	}
+	return re.ReplaceAllStringFunc(block, func(m string) string {
+		sub := re.FindStringSubmatch(m)
+		v, _ := strconv.Atoi(sub[2])
+		if v+1 >= pivot { // 0 基锚点换算成 1 基与 pivot 对齐
+			v += delta
+			if v < 0 {
+				v = 0
+			}
+		}
+		return sub[1] + strconv.Itoa(v) + sub[3]
+	})
 }

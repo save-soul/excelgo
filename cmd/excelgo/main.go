@@ -2,7 +2,7 @@
 //
 // 用法概览：
 //
-//	excelgo copy   <输入.xlsx> <输出.xlsx> <表名或索引> [--independent] [--suffix 后缀]
+//	excelgo copy   <输入.xlsx> <输出.xlsx> <表名或索引> [--name 新表名] [--independent] [--suffix 后缀]
 //	excelgo merge  <目标.xlsx> <源.xlsx>:<表> [源.xlsx>:<表> ...] [--suffix 冲突后缀]
 //	excelgo list   <文件.xlsx>
 //	excelgo newsheet <文件.xlsx> <新表名>
@@ -28,6 +28,87 @@ import (
 
 	"github.com/save-soul/excelgo"
 )
+
+// parseFlags 解析命令行参数，并允许「位置参数与 flags 任意混排」。
+//
+// 标准库 flag.Parse 遇到第一个非 flag 参数就停止解析，导致
+//
+//	excelgo copy a.xlsx b.xlsx Sheet1 --name 汇总表
+//
+// 中的 --name 被静默忽略（连同 --suffix/--independent 等所有 flag）。
+// 这里先把参数按「flag 段」与「位置参数段」分离，再依次解析，
+// 使上例与 `excelgo copy --name 汇总表 a.xlsx b.xlsx Sheet1` 等价。
+//
+// 未注册的 token 按横线数量区分处理：
+//   - `-5`、`-1.5`、`-副本` 等单横线 token：视为位置参数，交由业务层处理
+//     （否则 setcell A1 -5 这类负数单元格值会被误判为 flag 而报错）；
+//   - `--typo` 等双横线 token：交回 flag 包报错，让用户看到 "flag provided but not
+//     defined"，避免打错字却静默无效。
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	var flagArgs, posArgs []string
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		// "--" 之后全部视为位置参数
+		if a == "--" {
+			posArgs = append(posArgs, args[i+1:]...)
+			break
+		}
+		if name, _, hasEq, isFlag := splitFlag(a); isFlag {
+			// 未注册的双横线 token：交给 flag 包报错以提示用户打错字
+			if fs.Lookup(name) == nil {
+				if strings.HasPrefix(a, "--") {
+					flagArgs = append(flagArgs, a)
+					i++
+					continue
+				}
+				posArgs = append(posArgs, a)
+				i++
+				continue
+			}
+			if hasEq {
+				flagArgs = append(flagArgs, a) // 已含 =value
+				i++
+				continue
+			}
+			flagArgs = append(flagArgs, a)
+			i++
+			// 非布尔 flag 吞掉下一个 token 作为值
+			if i < len(args) {
+				if bf, isBool := fs.Lookup(name).Value.(interface{ IsBoolFlag() bool }); !isBool || !bf.IsBoolFlag() {
+					flagArgs = append(flagArgs, args[i])
+					i++
+				}
+			}
+			continue
+		}
+		posArgs = append(posArgs, a)
+		i++
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		return err
+	}
+	// 再用位置参数解析一次，使 fs.Args() 返回位置参数（不含 flag）。
+	// 加 "--" 前缀确保其中任何 "-xxx" 都不会被当作 flag。
+	_ = fs.Parse(append([]string{"--"}, posArgs...))
+	return nil
+}
+
+// splitFlag 尝试把一个 token 拆成 flag 名与内联值。
+// ok=false 表示该 token 不是 flag 形态（裸字符串、单个横线等）。
+func splitFlag(a string) (name, value string, hasEq, ok bool) {
+	if len(a) < 2 || a[0] != '-' {
+		return "", "", false, false
+	}
+	body := strings.TrimPrefix(strings.TrimPrefix(a, "-"), "-")
+	if body == "" {
+		return "", "", false, false // "-" 或 "--"
+	}
+	if eq := strings.Index(body, "="); eq >= 0 {
+		return body[:eq], body[eq+1:], true, true
+	}
+	return body, "", false, true
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -121,7 +202,7 @@ func printUsage() {
 
 用法：
   excelgo copy       <输入.xlsx> <输出.xlsx> <表名或索引> [flags]
-  excelgo merge      <目标.xlsx> <源.xlsx>:<表> [源.xlsx>:<表> ...] [flags]
+  excelgo merge      <目标.xlsx> <源.xlsx>[:表] [源.xlsx:表 ...] [flags]   # 省略:表 则合并该簿全部工作表
   excelgo list       <文件.xlsx>
   excelgo newsheet   <文件.xlsx> <新表名>
   excelgo delsheet   <文件.xlsx> <表名或索引>
@@ -155,7 +236,7 @@ func printUsage() {
   excelgo replace     <文件.xlsx> <表> <旧文本> <新文本>
   excelgo docprops    <文件.xlsx> [--title T] [--author A] [--subject S]
 
-copy flags:    --independent 独立媒体副本  --suffix 后缀(默认 _copy)
+copy flags:    --name 指定新表名  --independent 独立媒体副本  --suffix 后缀(默认 _copy)
 merge flags:   --suffix 冲突后缀(默认 _merge)
 setcell types: str(共享字符串,默认) | num(数值) | bool(布尔) | formula(公式,需 --result 可选)
 addpic flags:  --cell 锚定单元格(默认 A1) --col-off 列偏移像素(默认0) --row-off 行偏移像素(默认0) --scale 缩放比(默认1)
@@ -181,11 +262,15 @@ func runCopy(args []string) {
 	fs := flag.NewFlagSet("copy", flag.ExitOnError)
 	independent := fs.Bool("independent", false, "复制体拥有独立媒体副本（可单独编辑/删除），默认共享媒体")
 	suffix := fs.String("suffix", "_copy", "新工作表名后缀")
-	fs.Parse(args)
+	newName := fs.String("name", "", "直接指定新工作表名（优先于 --suffix）")
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 
 	pos := fs.Args()
 	if len(pos) < 3 {
-		fmt.Fprintln(os.Stderr, "用法: excelgo copy <输入.xlsx> <输出.xlsx> <工作表名或索引> [--independent] [--suffix 后缀]")
+		fmt.Fprintln(os.Stderr, "用法: excelgo copy <输入.xlsx> <输出.xlsx> <工作表名或索引> [--name 新表名] [--independent] [--suffix 后缀]")
 		os.Exit(1)
 	}
 	inputFile := pos[0]
@@ -200,7 +285,12 @@ func runCopy(args []string) {
 		opts = append(opts, excelgo.WithMedia(excelgo.MediaShared))
 	}
 
-	if err := excelgo.CopySheet(inputFile, outputFile, sheetRef, opts...); err != nil {
+	f, err := excelgo.Open(inputFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
+	if err := f.CopySheetTo(outputFile, sheetRef, *newName, opts...); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
 	}
@@ -210,40 +300,87 @@ func runCopy(args []string) {
 func runMerge(args []string) {
 	fs := flag.NewFlagSet("merge", flag.ExitOnError)
 	suffix := fs.String("suffix", "_merge", "命名冲突时追加的后缀")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 
 	pos := fs.Args()
 	if len(pos) < 2 {
-		fmt.Fprintln(os.Stderr, "用法: excelgo merge <目标.xlsx> <源.xlsx>:<表名或索引> [源.xlsx:表 ...] [--suffix 冲突后缀]")
+		fmt.Fprintln(os.Stderr, "用法: excelgo merge <目标.xlsx> <源.xlsx>[:表名或索引] [源.xlsx:表 ...] [--suffix 冲突后缀]")
 		os.Exit(1)
 	}
 	dst := pos[0]
 	var sources []excelgo.SourceRef
 	for _, spec := range pos[1:] {
-		idx := strings.LastIndex(spec, ":")
-		if idx < 0 {
-			fmt.Fprintf(os.Stderr, "错误: 源参数 %q 缺少 \":表名\" 后缀，正确格式如 \"src.xlsx:Sheet1\"\n", spec)
+		refs, err := parseSourceSpec(spec)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误: 源参数 %q 解析失败: %v\n", spec, err)
 			os.Exit(1)
 		}
-		wb := spec[:idx]
-		sheet := spec[idx+1:]
-		if wb == "" || sheet == "" {
-			fmt.Fprintf(os.Stderr, "错误: 源参数 %q 解析失败，正确格式如 \"src.xlsx:Sheet1\"\n", spec)
-			os.Exit(1)
-		}
-		sources = append(sources, excelgo.SourceRef{Workbook: wb, Sheet: sheet})
+		sources = append(sources, refs...)
 	}
 
-	if err := excelgo.MergeWorkbook(dst, sources, excelgo.WithMergeSuffix(*suffix)); err != nil {
+	f, err := excelgo.Open(dst)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
+	merr := f.Merge(sources, excelgo.WithMergeSuffix(*suffix))
+	// 尽量回写已合并部分（与旧包级函数行为一致），再报告首个错误。
+	if serr := f.Save(); serr != nil {
+		if merr != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", merr)
+		} else {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", serr)
+		}
+		os.Exit(1)
+	}
+	if merr != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", merr)
 		os.Exit(1)
 	}
 	fmt.Printf("成功：已将 %d 个工作表合并进 %q（冲突后缀：%s）\n", len(sources), dst, *suffix)
 }
 
+// parseSourceSpec 解析 "路径:表" 形式的源说明。
+//
+// 关键点：Windows 路径含盘符冒号（如 D:\a.xlsx），而 Excel 工作表名不允许含冒号，
+// 因此只有「位置 > 1 的最后一个冒号」才作为 文件:表 分隔符——盘符冒号 D:（idx==1）
+// 必须被排除，否则会把 Workbook 截断成 "D" 导致 open D: 失败。
+//
+// 未给出 ":表" 时，默认合并该源工作簿的全部工作表。
+func parseSourceSpec(spec string) ([]excelgo.SourceRef, error) {
+	idx := strings.LastIndex(spec, ":")
+	if idx > 1 {
+		wb := spec[:idx]
+		sheet := spec[idx+1:]
+		if wb == "" || sheet == "" {
+			return nil, fmt.Errorf("格式应为 \"路径:表名\"")
+		}
+		return []excelgo.SourceRef{{Workbook: wb, Sheet: sheet}}, nil
+	}
+	// 未指定工作表：合并源工作簿的全部工作表
+	list, err := excelgo.GetSheetList(spec)
+	if err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, fmt.Errorf("工作簿 %q 中没有任何工作表", spec)
+	}
+	refs := make([]excelgo.SourceRef, 0, len(list))
+	for _, name := range list {
+		refs = append(refs, excelgo.SourceRef{Workbook: spec, Sheet: name})
+	}
+	return refs, nil
+}
+
 func runList(args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 1 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo list <文件.xlsx>")
@@ -262,7 +399,10 @@ func runList(args []string) {
 
 func runNewSheet(args []string) {
 	fs := flag.NewFlagSet("newsheet", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 2 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo newsheet <文件.xlsx> <新表名>")
@@ -278,7 +418,10 @@ func runNewSheet(args []string) {
 
 func runDeleteSheet(args []string) {
 	fs := flag.NewFlagSet("delsheet", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 2 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo delsheet <文件.xlsx> <表名或索引>")
@@ -293,7 +436,10 @@ func runDeleteSheet(args []string) {
 
 func runMoveSheet(args []string) {
 	fs := flag.NewFlagSet("movesheet", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 3 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo movesheet <文件.xlsx> <表名或索引> <目标位置(1基)>")
@@ -313,7 +459,10 @@ func runMoveSheet(args []string) {
 
 func runRenameSheet(args []string) {
 	fs := flag.NewFlagSet("renamesheet", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 3 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo renamesheet <文件.xlsx> <旧名> <新名>")
@@ -328,7 +477,10 @@ func runRenameSheet(args []string) {
 
 func runGetCell(args []string) {
 	fs := flag.NewFlagSet("getcell", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 3 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo getcell <文件.xlsx> <表> <单元格>")
@@ -343,15 +495,23 @@ func runGetCell(args []string) {
 }
 
 func runSetCell(args []string) {
-	// 提取 --type / --result（支持放在任意位置，避免 flag 包的顺序限制）
-	typ, result, posArgs := extractFlags(args, "str", "")
+	// 复用统一的 parseFlags：支持 flag 放在任意位置，且缺值时由 flag 包报错
+	// （旧的 extractFlags 在 --type 缺值时会死循环）。
+	fs := flag.NewFlagSet("setcell", flag.ExitOnError)
+	typ := fs.String("type", "str", "值类型：str|num|bool|formula")
+	result := fs.String("result", "", "公式预计算结果（仅 --type formula）")
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
+	posArgs := fs.Args()
 	if len(posArgs) < 4 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo setcell <文件.xlsx> <表> <单元格> <值> [--type str|num|bool|formula] [--result 预计算结果]")
 		os.Exit(1)
 	}
 	file, sheet, cell, value := posArgs[0], posArgs[1], posArgs[2], posArgs[3]
 	var err error
-	switch typ {
+	switch *typ {
 	case "str":
 		err = excelgo.SetCellStr(file, sheet, cell, value)
 	case "num":
@@ -367,51 +527,16 @@ func runSetCell(args []string) {
 			err = excelgo.SetCellBool(file, sheet, cell, b)
 		}
 	case "formula":
-		err = excelgo.SetCellFormula(file, sheet, cell, value, result)
+		err = excelgo.SetCellFormula(file, sheet, cell, value, *result)
 	default:
-		fmt.Fprintf(os.Stderr, "未知 --type: %q（支持 str|num|bool|formula）\n", typ)
+		fmt.Fprintf(os.Stderr, "未知 --type: %q（支持 str|num|bool|formula）\n", *typ)
 		os.Exit(1)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("成功：已写入 %s!%s = %q (type=%s)\n", sheet, cell, value, typ)
-}
-
-// extractFlags 从参数中提取 --type 与 --result（支持任意位置），返回 (type, result, 剩余位置参数)。
-func extractFlags(args []string, defType, defResult string) (string, string, []string) {
-	typ := defType
-	result := defResult
-	var pos []string
-	i := 0
-	for i < len(args) {
-		a := args[i]
-		switch a {
-		case "--type":
-			if i+1 < len(args) {
-				typ = args[i+1]
-				i += 2
-				continue
-			}
-		case "--result":
-			if i+1 < len(args) {
-				result = args[i+1]
-				i += 2
-				continue
-			}
-		default:
-			if strings.HasPrefix(a, "--type=") {
-				typ = strings.TrimPrefix(a, "--type=")
-			} else if strings.HasPrefix(a, "--result=") {
-				result = strings.TrimPrefix(a, "--result=")
-			} else {
-				pos = append(pos, a)
-			}
-			i++
-		}
-	}
-	return typ, result, pos
+	fmt.Printf("成功：已写入 %s!%s = %q (type=%s)\n", sheet, cell, value, *typ)
 }
 
 func runAddPic(args []string) {
@@ -420,7 +545,10 @@ func runAddPic(args []string) {
 	colOff := fs.Int("col-off", 0, "列偏移像素")
 	rowOff := fs.Int("row-off", 0, "行偏移像素")
 	scale := fs.Float64("scale", 1.0, "缩放比例（默认 1）")
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 3 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo addpic <文件.xlsx> <表> <图片路径> [--cell A1] [--col-off N] [--row-off N] [--scale F]")
@@ -439,7 +567,10 @@ func runAddPic(args []string) {
 
 func runAddCellPic(args []string) {
 	fs := flag.NewFlagSet("addcellpic", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 4 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo addcellpic <文件.xlsx> <表> <单元格> <图片路径>")
@@ -454,7 +585,10 @@ func runAddCellPic(args []string) {
 
 func runRows(args []string) {
 	fs := flag.NewFlagSet("rows", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 4 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo rows insert|remove <文件.xlsx> <表> <行号(1基)> <数量>")
@@ -489,7 +623,10 @@ func runRows(args []string) {
 
 func runCols(args []string) {
 	fs := flag.NewFlagSet("cols", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 4 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo cols insert|remove <文件.xlsx> <表> <列号(1基)> <数量>")
@@ -531,7 +668,10 @@ func strategyName(independent bool) string {
 
 func runRangeGet(args []string) {
 	fs := flag.NewFlagSet("rangeget", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 3 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo rangeget <文件.xlsx> <表> <区域>  例 A1:C10")
@@ -549,7 +689,10 @@ func runRangeGet(args []string) {
 
 func runRangeSet(args []string) {
 	fs := flag.NewFlagSet("rangeset", flag.ExitOnError)
-	fs.Parse(args)
+	if err := parseFlags(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		os.Exit(1)
+	}
 	pos := fs.Args()
 	if len(pos) < 4 {
 		fmt.Fprintln(os.Stderr, "用法: excelgo rangeset <文件.xlsx> <表> <区域> <数据>  例 \"a,b;1,2\"（行以;分，单元格以,分；值以=开头视为公式）")

@@ -253,7 +253,7 @@ func addCellPictureBytes(filename, sheetRef, cell string, data []byte) error {
 	// 3) worksheet 插入 mc:AlternateContent 块（在 sheetData 之后、drawing 之前），
 	//    并确保命名空间（mc/x14/a/xdr）。
 	ws := string(fileMap[file])
-	alt := buildCellPictureAltContent(col, row, imgRID)
+	alt := buildCellPictureAltContent(col, row, newRelIDFrom(imgRID))
 	ws = ensureWorksheetNamespaces(ws)
 	ws = ensureX14Namespace(ws)
 	ws = insertCellPictureBlock(ws, alt)
@@ -293,12 +293,12 @@ func appendOneCellAnchor(dw string, col, row, colOffPx, rowOffPx, extCx, extCy i
 }
 
 // buildCellPictureAltContent 构造 WPS 单元格内嵌图片的 mc:AlternateContent 块。
-func buildCellPictureAltContent(col, row int, rID string) string {
+func buildCellPictureAltContent(col, row int, rID relID) string {
 	return `<mc:AlternateContent>` +
 		`<mc:Choice Requires="x14">` +
 		`<x14:picture>` +
 		`<x14:pic>` +
-		`<x14:blip r:embed="` + rID + `" />` +
+		`<x14:blip r:embed="` + string(rID) + `" />` +
 		`<x14:bodyPr />` +
 		`<x14:clientData fPrintsWithSheet="1" />` +
 		`</x14:pic>` +
@@ -307,7 +307,7 @@ func buildCellPictureAltContent(col, row int, rID string) string {
 		`<mc:Fallback>` +
 		`<xdr:pic>` +
 		`<xdr:nvPicPr><xdr:cNvPr id="1" name="Picture" descr="Cell Picture" /><xdr:cNvPicPr /></xdr:nvPicPr>` +
-		`<xdr:blipFill><a:blip r:embed="` + rID + `" /><a:stretch><a:fillRect /></a:stretch></xdr:blipFill>` +
+		`<xdr:blipFill><a:blip r:embed="` + string(rID) + `" /><a:stretch><a:fillRect /></a:stretch></xdr:blipFill>` +
 		`<xdr:spPr><a:prstGeom prst="rect" /><a:xfrm><a:off x="0" y="0" /><a:ext cx="0" cy="0" /></a:xfrm></xdr:spPr>` +
 		`</xdr:pic>` +
 		`</mc:Fallback>` +
@@ -316,15 +316,16 @@ func buildCellPictureAltContent(col, row int, rID string) string {
 
 // insertDrawingRef 在 worksheet 中加入 <drawing r:id="rid"/>（放在 sheetData 之后）。
 func insertDrawingRef(ws, rid string) string {
-	tag := `<drawing r:id="` + rid + `"/>`
+	// rid 由库内 insertRelationship 生成（形如 rIdN），非用户数据
+	tag := frag(`<drawing r:id="` + safeAttr(rid) + `"/>`)
 	// 放在 sheetData 之后；若无 sheetData 则放在 worksheet 根末尾前
 	if idx := strings.LastIndex(ws, "</sheetData>"); idx != -1 {
-		return ws[:idx+len("</sheetData>")] + tag + ws[idx+len("</sheetData>"):]
+		return ws[:idx+len("</sheetData>")] + string(tag) + ws[idx+len("</sheetData>"):]
 	}
 	if idx := strings.LastIndex(ws, "</worksheet>"); idx != -1 {
-		return ws[:idx] + tag + ws[idx:]
+		return ws[:idx] + string(tag) + ws[idx:]
 	}
-	return ws + tag
+	return ws + string(tag)
 }
 
 // insertCellPictureBlock 把 mc:AlternateContent 块插入 worksheet：sheetData 之后、drawing 之前。

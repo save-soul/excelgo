@@ -11,7 +11,11 @@ func setupFeatureWB(t *testing.T) string {
 	t.Helper()
 	src := "../testdata_tmp/full.xlsx"
 	dst := t.TempDir() + "/feat.xlsx"
-	if err := CopySheet(src, dst, "Sheet1", WithSuffix("_base")); err != nil {
+	bf, err := Open(src)
+	if err != nil {
+		t.Fatalf("准备测试簿失败: %v", err)
+	}
+	if err := bf.CopySheetTo(dst, "Sheet1", "", WithSuffix("_base")); err != nil {
 		t.Fatalf("准备测试簿失败: %v", err)
 	}
 	// 新建一个干净的工作表用于写入
