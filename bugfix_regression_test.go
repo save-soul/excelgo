@@ -3401,3 +3401,120 @@ func assertSharedStringIndicesInRange(t *testing.T, xlsx string) {
 		}
 	}
 }
+
+// TestDeleteSheetRemovesDefinedNamesReferencingIt 验证删除工作表时，
+// 按**表名**引用该表的工作簿级命名区域会被一并清理。
+//
+// 症状：删掉模板表后，Excel 打开提示「发现不可读取的内容，是否修复」，
+// 修复后**静默丢弃**打印区域与重复打印标题 —— 用户视角是「打印设置莫名丢了」。
+//
+// 根因：reindexDefinedNamesAfterDelete 早期只按 localSheetId 清理，而工作簿级
+// 命名区域（无 localSheetId）靠 refersTo 里的表名表达引用，代码从未校验表名是否还在。
+// 于是 '月报模板'!$1:$6 成为悬空引用。
+func TestDeleteSheetRemovesDefinedNamesReferencingIt(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "book.xlsx")
+	b, err := Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 前缀关系的表名：验证 "月报" 与 "月报模板" 共存时不会误删
+	for _, n := range []string{"月报", "月报模板", "数据"} {
+		ws, err := b.NewSheet(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ws.SetCellValue("A1", n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.SaveAs(f); err != nil {
+		t.Fatal(err)
+	}
+
+	// 一组覆盖各种写法的定义区域
+	mustSet := map[string]string{
+		"引用被删表":    "'月报模板'!$1:$6",
+		"引用保留表":    "'月报'!$1:$6",
+		"前缀相同不误删":  "'月报模板X'!$1:$6",
+		"多表逗号含被删表": "'月报'!$1:$6,'月报模板'!$1:$6",
+		"无引号写法":    "数据!$A$1",
+		"常量不误删":    "42",
+		"函数不误删":    "SUM(Sheet1!A1:A9)",
+	}
+	for name, ref := range mustSet {
+		if err := SetDefinedName(f, name, ref); err != nil {
+			t.Fatalf("SetDefinedName(%s): %v", name, err)
+		}
+	}
+	// 表级打印标题行（带 localSheetId，删表本就该清理）
+	tpl, err := b.Sheet("月报模板")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tpl
+	if err := SetDefinedName(f, "_xlnm.Print_Titles", "月报模板!$1:$6"); err != nil {
+		t.Fatalf("设置打印标题: %v", err)
+	}
+
+	if err := DeleteSheet(f, "月报模板"); err != nil {
+		t.Fatalf("DeleteSheet: %v", err)
+	}
+
+	wbXML := readZipPart(t, f, "xl/workbook.xml")
+	// 被删表必须消失
+	if strings.Contains(wbXML, "月报模板") && !strings.Contains(wbXML, "月报模板X") {
+		t.Errorf("删除后仍残留对被删表的引用：\n%s", wbXML)
+	}
+	// 逐条核对：应删的删了，不该删的还在
+	assertDefinedNameAbsent(t, wbXML, "引用被删表")
+	assertDefinedNameAbsent(t, wbXML, "多表逗号含被删表")
+	assertDefinedNameAbsent(t, wbXML, "_xlnm.Print_Titles")
+	assertDefinedNamePresent(t, wbXML, "引用保留表")
+	assertDefinedNamePresent(t, wbXML, "前缀相同不误删")
+	assertDefinedNamePresent(t, wbXML, "无引号写法")
+	assertDefinedNamePresent(t, wbXML, "常量不误删")
+	assertDefinedNamePresent(t, wbXML, "函数不误删")
+}
+
+// TestDefinedNameRefersToSheet 单元测试：表名边界判定。
+func TestDefinedNameRefersToSheet(t *testing.T) {
+	cases := []struct {
+		refersTo string
+		sheet    string
+		want     bool
+	}{
+		{"'月报模板'!$1:$6", "月报模板", true},
+		{"月报模板!$1:$6", "月报模板", true},
+		{"'月报'!$1:$6", "月报模板", false},    // 前缀相同，不算命中
+		{"'月报模板X'!$1:$6", "月报模板", false}, // 前缀相同，不算命中
+		{"'数据'!A1,'月报模板'!$1", "月报模板", true},
+		{"'Sheet1'!A1,数据!A2", "月报模板", false},
+		{"42", "月报模板", false},
+		{"SUM(Sheet1!A1:A9)", "月报模板", false},
+		{"", "月报模板", false},
+		{"'月报模板'!$1:$6", "", false}, // 无表名，不判
+	}
+	for _, c := range cases {
+		if got := definedNameRefersToSheet(c.refersTo, c.sheet); got != c.want {
+			t.Errorf("definedNameRefersToSheet(%q, %q) = %v, 期望 %v",
+				c.refersTo, c.sheet, got, c.want)
+		}
+	}
+}
+
+// assertDefinedNameAbsent 断言 workbook.xml 中不存在名为 name 的 definedName。
+func assertDefinedNameAbsent(t *testing.T, wbXML, name string) {
+	t.Helper()
+	if strings.Contains(wbXML, `name="`+name+`"`) {
+		t.Errorf("definedName %q 应已被清理，但仍存在", name)
+	}
+}
+
+// assertDefinedNamePresent 断言 workbook.xml 中存在名为 name 的 definedName。
+func assertDefinedNamePresent(t *testing.T, wbXML, name string) {
+	t.Helper()
+	if !strings.Contains(wbXML, `name="`+name+`"`) {
+		t.Errorf("definedName %q 不应被误删，但已消失", name)
+	}
+}

@@ -268,8 +268,11 @@ func deleteSheetInMap(fileMap map[string][]byte, sheetRef string) error {
 		fileMap["xl/_rels/workbook.xml.rels"], rid)
 
 	// 5) 清理该表打印区域（definedName）中 localSheetId 的重映射：
-	//    删除后其余表序号前移，需要把 localSheetId > index 的全部减 1（保持引用正确）。
-	fileMap["xl/workbook.xml"] = reindexDefinedNamesAfterDelete(fileMap["xl/workbook.xml"], index)
+	//    删除后其余表序号前移，需要把 localSheetId > index 的全部减 1（保持引用正确）；
+	//    同时清掉按**表名**引用该表的工作簿级命名区域（无 localSheetId），
+	//    否则它们会变成悬空引用，Excel 修复后静默丢弃打印设置。
+	fileMap["xl/workbook.xml"] = reindexDefinedNamesAfterDelete(
+		fileMap["xl/workbook.xml"], index, wb.Sheets.Sheet[sheetIdx].Name)
 
 	// 6) Content_Types：删除该 worksheet 的 Override（其他部件若不再被引用也可清，但
 	//    为安全仅删除 worksheet 自身；drawing/media 若被共享则保留）。
@@ -460,13 +463,18 @@ func removeRelationshipFromRels(relsXML []byte, rid string) []byte {
 	return []byte(re.ReplaceAllString(content, ""))
 }
 
-// reindexDefinedNamesAfterDelete 在删除序号为 delIdx（0 基）的工作表后，修正所有表级
-// （带 localSheetId）命名区域的引用，保持引用正确：
+// reindexDefinedNamesAfterDelete 在删除序号为 delIdx（0 基）、表名为 delName 的工作表后，
+// 修正所有命名区域的引用，保持引用正确：
 //   - 属于被删表的（localSheetId==delIdx，如该表专属的 _xlnm.Print_Area / _xlnm.Print_Titles
 //     及用户自建的表级命名区域）直接移除；
 //   - localSheetId>delIdx 的全部减 1（删除后其余表序号前移）；
-//   - 工作簿级（无 localSheetId）命名区域不受影响。
-func reindexDefinedNamesAfterDelete(wbXML []byte, delIdx int) []byte {
+//   - 工作簿级（无 localSheetId）命名区域若**按表名引用**被删表，同样移除。
+//
+// 最后一条最容易被漏掉：工作簿级命名区域没有 localSheetId，删表时若只按序号清理，
+// 它会变成悬空引用（'月报模板'!$1:$6 而月报模板已不存在）。Excel 遇到这种文件会弹
+// 「发现不可读取的内容，是否修复」，修复后**静默丢弃**该命名区域指向的打印区域与
+// 重复打印标题 —— 用户视角就是「打印设置莫名丢了」，极难排查。
+func reindexDefinedNamesAfterDelete(wbXML []byte, delIdx int, delName string) []byte {
 	content := string(wbXML)
 	re := regexp.MustCompile(`(?s)<definedName\b([^>]*)>(.*?)</definedName>`)
 	out := re.ReplaceAllStringFunc(content, func(m string) string {
@@ -480,6 +488,10 @@ func reindexDefinedNamesAfterDelete(wbXML []byte, delIdx int) []byte {
 		lsRe := regexp.MustCompile(`localSheetId="(\d+)"`)
 		lsM := lsRe.FindStringSubmatch(attrs)
 		if lsM == nil {
+			// 工作簿级（无 localSheetId）：按表名判断是否引用了被删表
+			if delName != "" && definedNameRefersToSheet(inner, delName) {
+				return ""
+			}
 			return m
 		}
 		id, _ := strconv.Atoi(lsM[1])
@@ -493,6 +505,38 @@ func reindexDefinedNamesAfterDelete(wbXML []byte, delIdx int) []byte {
 		return fmt.Sprintf(`<definedName%s>%s</definedName>`, newAttrs, inner)
 	})
 	return []byte(out)
+}
+
+// definedNameRefersToSheet 判断 definedName 的引用式（refersTo）是否引用了 sheetName。
+//
+// refersTo 形如 "'月报模板'!$1:$6" / "月报模板!A1:B2" / "Sheet1!$A$1:$J$37,Sheet2!$A$1"。
+// 表名可含空格与中文，故Excel 用单引号包裹；也允许不加引号。
+//
+// 匹配必须严格按**表名边界**：表名 A 存在时，不能把引用表名 "AB" 的定义区域误判为
+// 引用 A。因此逐个按 '!' 切出引用段，取 '!' 之前的部分作为表名再精确比较；
+// 表名本身含 '!' 时无法用此法区分，退化为不匹配（宁可漏删也不误删）。
+func definedNameRefersToSheet(refersTo, sheetName string) bool {
+	if sheetName == "" || refersTo == "" {
+		return false
+	}
+	want := "'" + sheetName + "'"
+	for _, seg := range strings.Split(refersTo, ",") {
+		seg = strings.TrimSpace(seg)
+		idx := strings.Index(seg, "!")
+		if idx < 0 {
+			// 无 '!' 的定义区域不是表引用（如常量、公式），跳过
+			continue
+		}
+		if sheetName == "" && strings.Contains(seg, "!") {
+			// 表名含 '!'：无法可靠切分，跳过避免误判
+			continue
+		}
+		name := strings.TrimSpace(seg[:idx])
+		if name == want || name == sheetName {
+			return true
+		}
+	}
+	return false
 }
 
 // moveSheetInWorkbookXML 把第 fromIdx（0 基）个 <sheet> 移动到 toIdx（0 基）位置。
