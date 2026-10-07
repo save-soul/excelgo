@@ -125,6 +125,7 @@ func GetNamedStyles(filename, sheetRef string) ([]NamedStyleRef, error) {
 // OOXML 的两处结构：
 //   - <cellStyleXfs>  —— 命名样式指向的"底层 xf"（不含 applyXxx 标志）
 //   - <cellStyles>    —— 命名样式清单，name 属性即用户看到的样式名
+//
 // 同时要让 <dxfs> 之前保持顺序 —— cellStyles 必须在 dxfs 之前（OOXML 要求）。
 func applyNamedStyle(stylesXML, name string, st Style) (string, int, error) {
 	// 1) 生成底层 xf 并注册进 cellXfs（复用既有逻辑拿到 s 索引）

@@ -141,6 +141,7 @@ func tinyPNGPath(t *testing.T) string {
 	}
 	return p
 }
+
 // zipPartNames 列出 zip 中全部部件名。
 func zipPartNames(t *testing.T, path string) []string {
 	t.Helper()

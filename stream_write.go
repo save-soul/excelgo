@@ -505,7 +505,7 @@ type numLit string
 // cellOpen 是 <c> 标签的开头部分（属性部分），如 `<c r="A1" s="2"`。
 //
 // 认证依据：只可能由 cellRef（经 newCellRef 校验的坐标）与 styleIndex
-//（库内生成的样式索引）拼成，不含用户输入。
+// （库内生成的样式索引）拼成，不含用户输入。
 type cellOpen string
 
 // numCell 拼出数值单元格：<c ...><v>数字</v></c>。

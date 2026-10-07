@@ -285,7 +285,7 @@ func snippetAround(s, needle string, width int) string {
 	if i == -1 {
 		return s
 	}
-	start := i - width / 2
+	start := i - width/2
 	if start < 0 {
 		start = 0
 	}

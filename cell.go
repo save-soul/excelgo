@@ -742,13 +742,14 @@ var excelDateBase = time.Date(1899, 12, 30, 0, 0, 0, 0, time.UTC)
 // timeToExcelSerial 把 time.Time 转成 Excel 序列号（小数为当天的时间占比）。
 //
 // 算法必须与 serialToTime（读侧）**严格互逆**，否则往返会差几百纳秒：
-//序列号是 float64（约 15-16 位有效数字），乘 86400 会放大尾数误差。
+// 序列号是 float64（约 15-16 位有效数字），乘 86400 会放大尾数误差。
 // 早期两侧各写一套（写侧 d.Hours()/24，读侧 serial*86400*1e9），
 // 23:59:59 往返后会变成 23:59:59.000000512。
 //
 // 现在两侧统一为"整数秒 + 小数秒"的分解：
-//   写：(总秒 + 纳秒/1e9) / 86400
-//   读：序列号 * 86400 拆成整数秒与小数秒，再合成 Duration
+//
+//	写：(总秒 + 纳秒/1e9) / 86400
+//	读：序列号 * 86400 拆成整数秒与小数秒，再合成 Duration
 func timeToExcelSerial(t time.Time) float64 {
 	d := t.UTC().Sub(excelDateBase)
 	secs := float64(int64(d/time.Second)) + float64(d%time.Second)/1e9

@@ -207,7 +207,7 @@ func copySheetInMap(fileMap map[string][]byte, sheetRef, newName string, opts ..
 }
 
 // CopySheet 复制本工作簿内由 sheetRef（名称或 1 基索引）指定的工作表，追加到末尾
-//（excelize 式「同工作簿内复制」语义）。
+// （excelize 式「同工作簿内复制」语义）。
 //
 // newName 为空字符串时用「源表名 + WithSuffix 后缀」（默认 "_copy"）；非空时直接
 // 作为新表名，重名则自动补数字序号避让。
@@ -1029,7 +1029,9 @@ func getMaxSheetID(wb *Workbook) int {
 // Target 改写为指向新副本。
 //
 // 为什么必须递归：OOXML 的关系链是多级的 ——
+//
 //	sheet -> drawing -> chart -> （可选：嵌入工作簿 / colors / style）
+//
 // 只处理第一层的话，drawing 的 rels 会被原样复制，而它指向的 chartN.xml
 // 从未被复制，于是留下悬空关系，Excel/WPS 判定文件损坏。
 //

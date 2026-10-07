@@ -17,8 +17,8 @@ import (
 
 // styleCase 一个样式差分场景：同一份样式两侧各写一次，比对读回结果。
 type styleCase struct {
-	Name    string
-	Style   Style
+	Name  string
+	Style Style
 	// Ops 是 openpyxl 侧的等价写法（JSON 的 style 片段）
 	Ops string
 	// OpenpyxlOK 标记 openpyxl 是否有等价能力（false = 跳过执行，仅验证本库侧）
@@ -77,7 +77,7 @@ func TestDiffStyleEnums(t *testing.T) {
 			OpenpyxlOK: true,
 		},
 		{
-			Name: "填充-灰色125",
+			Name:  "填充-灰色125",
 			Style: Style{Fill: &FillStyle{Color: "FFD9D9D9", PatternType: "gray125"}},
 			// openpyxl 只能设 solid 填充，无法表达图案类型 —— 属能力差异。
 			// 这里只验证本库产物能被 openpyxl 严格加载（不比对具体值）。
@@ -85,7 +85,7 @@ func TestDiffStyleEnums(t *testing.T) {
 			SkipReason: "openpyxl 侧无法设置非 solid 的填充图案（能力差异，非缺陷）",
 		},
 		{
-			Name: "组合-字体填充边框对齐全开",
+			Name:  "组合-字体填充边框对齐全开",
 			Style: Style{Font: &FontStyle{Bold: true, Italic: true, Underline: "single", Strike: true, Size: 12, Name: "宋体", Color: "FF112233"}, Fill: &FillStyle{Color: "FFAABBCC", PatternType: "solid"}, Border: &BorderStyle{Left: BorderSide{Style: "thin", Color: "FF000000"}, Bottom: BorderSide{Style: "medium", Color: "FFFF0000"}}, Alignment: &AlignmentStyle{Horizontal: "center", Vertical: "center", WrapText: true}},
 			// 两侧 JSON 必须完全等价 —— 之前漏了 underline/strike，
 			// 测的是"用例不对称"而非实现差异。

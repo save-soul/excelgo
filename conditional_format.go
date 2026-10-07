@@ -71,21 +71,21 @@ type ConditionalFormatRule struct {
 	StopIfTrue bool
 
 	// --- top10 ---
-	Rank   int
+	Rank    int
 	Percent bool
 	Bottom  bool
 
 	// --- aboveAverage ---
-	AboveAverage  *bool
+	AboveAverage *bool
 	EqualAverage *bool
 
 	// --- colorScale / dataBar / iconSet ---
-	ColorScale []ColorScalePoint
-	Color      string
-	MinType    string
-	MaxType    string
-	ShowValue  *bool
-	IconSet    string
+	ColorScale   []ColorScalePoint
+	Color        string
+	MinType      string
+	MaxType      string
+	ShowValue    *bool
+	IconSet      string
 	ReverseIcons bool
 
 	// --- dxf 样式（命中后应用）---
