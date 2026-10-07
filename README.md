@@ -902,8 +902,14 @@ excelgo setstyle wb.xlsx Sheet1 A1:C3 --bold --italic --underline single \
 ## Testing
 
 ```bash
-go test ./...
+go test -timeout 30m ./...
 ```
+
+> **A note on the timeout.** The suite takes roughly **10 minutes**, because every differential
+> test spawns a Python/openpyxl subprocess to act as an independent oracle. That exceeds
+> `go test`'s default 10-minute limit, hence the explicit `-timeout 30m` above. Without it you
+> get `panic: test timed out after 10m0s` — which reads like a hang but is only the ceiling
+> being reached. To run a single case: `go test -run TestName -v .`
 
 Unit tests (`excelgo/*_test.go`, `cmd/excelgo/*_test.go`) cover the object API, formula
 reference shifting, copy/merge, style dedup, merge cells / column width / freeze / hyperlink

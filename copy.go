@@ -547,10 +547,17 @@ func getXMLFromMap(fileMap map[string][]byte, filename string, v interface{}) er
 // ---------- 字符串插入函数（保留命名空间） ----------
 
 // insertSheetInWorkbookXML 向 <sheets> 末尾追加一个 <sheet> 标签。
-// sheetName 必须做 XML 属性转义：表名允许含 & < > " 等字符（Excel 本身也允许），
+// sheetName 必须做 XML 属性转义：表名允许含& < > " 等字符（Excel 本身也允许），
 // 裸写会破坏 workbook.xml 结构，导致整个 <sheets> 解析失败、所有工作表“消失”。
 func insertSheetInWorkbookXML(workbookXML []byte, sheetName string, sheetID int, rid string) []byte {
 	content := string(workbookXML)
+	// 本函数要写 r:id 前缀，故必须保证前缀有声明。
+	// openpyxl 生成的工作簿把 xmlns:r 声明在**每个 <sheet> 元素自己身上**（根上没有），
+	// 于是「根未声明 + 原有 sheet 各带声明」的文件在改动前是合法的。但只要流程把那些
+	// 带声明的 sheet 删光、只剩本函数新插入的 <sheet>，r: 前缀就失去声明，
+	// 文件直接损坏（openpyxl: unbound prefix；Excel: 提示修复甚至打不开）。
+	// 与 ensureWorksheetNamespaces 同理：写入前先确保声明，而不是事后补救。
+	content = ensureWorkbookRelNamespace(content)
 	// workbook.xml 中工作表关系属性使用带 r: 命名空间前缀的 r:id，必须保留前缀，
 	// 否则 Excel 无法解析工作表与关系的对应（文件判为损坏）。
 	sheetTag := fmt.Sprintf(`<sheet name="%s" sheetId="%d" r:id="%s"/>`,
@@ -565,6 +572,33 @@ func insertSheetInWorkbookXML(workbookXML []byte, sheetName string, sheetID int,
 		return []byte(content[:insertPos] + sheetTag + content[insertPos:])
 	}
 	return []byte(content[:insertPos] + sheetTag + content[insertPos:])
+}
+
+// ensureWorkbookRelNamespace 在 workbook.xml 根元素上补齐 xmlns:r 声明（幂等）。
+//
+// 只在**根元素**缺失时补，不动已有声明 —— openpyxl 把声明写在各个 <sheet> 上是合法
+// 的，重复声明会让文件变得啰嗦，且可能干扰按字节比对的下游工具。
+// 定位根元素时必须跳过<?xml ...?> 声明，否则会往XML 声明里插属性，产出坏文件。
+func ensureWorkbookRelNamespace(wbXML string) string {
+	// 跳过可能的 <?xml ...?> 声明与 BOM
+	start := strings.Index(wbXML, "<workbook")
+	if start == -1 {
+		return wbXML
+	}
+	rootEnd := strings.Index(wbXML[start:], ">")
+	if rootEnd == -1 {
+		return wbXML
+	}
+	rootEnd += start
+	root := wbXML[start : rootEnd+1]
+	// 判据必须只看**根元素**。早先用 strings.Contains(wbXML, ...) 全文搜索，
+	// 会被<sheet> 上的声明命中而误判"已声明"直接返回 —— 而恰恰在 openpyxl 那种
+	// 「声明写在各 <sheet> 上、根上没有」的文件里失效，正是本函数要修的场景。
+	if strings.Contains(root, `xmlns:r=`) {
+		return wbXML
+	}
+	newRoot := root[:len(root)-1] + ` xmlns:r="` + relationshipsNSURI + `">`
+	return wbXML[:start] + newRoot + wbXML[rootEnd+1:]
 }
 
 func insertRelationshipInRels(relsXML []byte, id, relType, target string) []byte {
@@ -725,6 +759,13 @@ func rewriteRIdRef(wsXML, oldRId, newRId string) string {
 	return strings.ReplaceAll(wsXML, `r:id="`+oldRId+`"`, `r:id="`+newRId+`"`)
 }
 
+// relationshipsNSURI 是 OOXML 关系（r: 前缀）绑定的命名空间 URI。
+// 集中定义，避免在多处硬编码字符串 —— 拼错一个字符就是unbound prefix 级损坏。
+const relationshipsNSURI = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+// spreadsheetMainNS 是 SpreadsheetML 主命名空间（workbook/worksheet 根元素的默认 xmlns）。
+const spreadsheetMainNS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
 // 确保工作表根元素声明内联图片块所需的命名空间前缀。
 // WPS 单元格内嵌图片（mc:AlternateContent / x14:picture / a:extLst）依赖这些前缀，
 // 缺失会导致 "unbound prefix" 损坏。
@@ -733,7 +774,7 @@ func ensureWorksheetNamespaces(wsXML string) string {
 		prefix string
 		uri    string
 	}{
-		{"r", "http://schemas.openxmlformats.org/officeDocument/2006/relationships"},
+		{"r", relationshipsNSURI},
 		{"mc", "http://schemas.openxmlformats.org/markup-compatibility/2006"},
 		{"x14", "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"},
 		{"a", "http://schemas.openxmlformats.org/drawingml/2006/main"},

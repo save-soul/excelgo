@@ -747,8 +747,13 @@ excelgo setstyle wb.xlsx Sheet1 A1:C3 --bold --italic --underline single \
 ## 测试
 
 ```bash
-go test ./...
+go test -timeout 30m ./...
 ```
+
+> **关于超时的说明**：全量跑一遍约需 **10 分钟**，因为每个差分用例都要拉起 Python/openpyxl
+> 子进程作为独立 oracle。这超过了 `go test` 默认的 10 分钟上限，所以上面的
+> `-timeout 30m` 是必需的 —— 漏掉它会看到 `panic: test timed out after 10m0s`，
+> 看起来像卡死，其实只是撞上了上限。只想跑单个用例：`go test -run TestName -v .`
 
 单元测试（`excelgo/*_test.go`、`cmd/excelgo/*_test.go`）覆盖对象 API、公式引用平移、复制/合并、样式去重、合并单元格/列宽/冻结/超链接/筛选、数据验证/条件格式/表格/批注/工作表属性、保护/分组/替换/文档属性等逻辑。
 

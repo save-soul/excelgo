@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -3517,4 +3518,251 @@ func assertDefinedNamePresent(t *testing.T, wbXML, name string) {
 	if !strings.Contains(wbXML, `name="`+name+`"`) {
 		t.Errorf("definedName %q 不应被误删，但已消失", name)
 	}
+}
+
+// TestInsertSheetDeclaresRelNamespace 验证往 workbook.xml 插入 <sheet> 时，
+// 根元素缺 xmlns:r 会被补齐。
+//
+// 背景：openpyxl 生成的工作簿把 xmlns:r 声明在**每个 <sheet> 元素自己身上**，
+// 根元素上没有。这种文件本身合法，但极具脆弱性：
+//
+//	<workbook xmlns="...main">
+//	  <sheet xmlns:r="...relationships" name="配置" sheetId="1" r:id="rId1"/>
+//	  <sheet xmlns:r="...relationships" name="月报模板" sheetId="2" r:id="rId2"/>
+//	</workbook>
+//
+// 只要流程把带声明的那些表删光、只剩本库新插入的 <sheet>，r: 前缀就失去声明：
+//
+//	<workbook xmlns="...main">
+//	  <sheet name="2026年1月" sheetId="4" r:id="rId6"/>   ← 前缀无人声明
+//	</workbook>
+//
+// 结果是文件损坏：openpyxl 抛 ParseError(unbound prefix)，
+// Excel 提示「发现不可读取的内容」甚至直接打不开。
+//
+// 精确触发条件（实测）：只 CopySheet 合法；CopySheet + 删部分表仍合法；
+// **CopySheet + 把带声明的表全删光才损坏**；源文件根上已有声明则永不触发。
+func TestInsertSheetDeclaresRelNamespace(t *testing.T) {
+	// openpyxl 风格：声明写在各<sheet> 上，根上没有
+	src := xmlDecl +
+		`<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+		`<sheets>` +
+		`<sheet xmlns:r="` + relationshipsNSURI + `" name="配置" sheetId="1" r:id="rId1"/>` +
+		`</sheets></workbook>`
+
+	got := string(insertSheetInWorkbookXML([]byte(src), "新表", 2, "rId6"))
+	root := workbookRootTag(got)
+
+	if !strings.Contains(root, `xmlns:r="`+relationshipsNSURI+`"`) {
+		t.Fatalf("根元素未补 xmlns:r 声明，插入的 <sheet r:id> 会成为 unbound prefix：\n%s", root)
+	}
+	if !strings.Contains(got, `<sheet name="新表" sheetId="2" r:id="rId6"/>`) {
+		t.Errorf("新表未正确插入：\n%s", got)
+	}
+	// 原有的表级声明不应被破坏
+	if !strings.Contains(got, `<sheet xmlns:r="`+relationshipsNSURI+`" name="配置"`) {
+		t.Errorf("原有 <sheet> 的声明被破坏：\n%s", got)
+	}
+}
+
+// TestEnsureWorkbookRelNamespace 单元测试该函数的幂等性与边界。
+func TestEnsureWorkbookRelNamespace(t *testing.T) {
+	decl := ` xmlns:r="` + relationshipsNSURI + `"`
+	cases := []struct {
+		name string
+		in   string
+		//wantDecl 为 true 表示根元素应含声明
+		wantDecl bool
+	}{
+		{"根上已有声明-不应重复添加",
+			xmlDecl + `<workbook xmlns="` + spreadsheetMainNS + `"` + decl + `><sheets/></workbook>`, true},
+		{"根上无声明-应补",
+			xmlDecl + `<workbook xmlns="` + spreadsheetMainNS + `"><sheets/></workbook>`, true},
+		{"声明只在 sheet 上-根仍需补",
+			xmlDecl + `<workbook xmlns="` + spreadsheetMainNS + `"><sheets>` +
+				`<sheet xmlns:r="` + relationshipsNSURI + `" name="A" r:id="rId1"/></sheets></workbook>`, true},
+		{"非workbook 根-原样返回",
+			`<foo><bar/></foo>`, false},
+		{"空字符串", "", false},
+		{"仅 xml 声明无根",
+			xmlDecl, false},
+	}
+	for _, c := range cases {
+		got := ensureWorkbookRelNamespace(c.in)
+		if c.wantDecl {
+			root := workbookRootTag(got)
+			if root == "" {
+				t.Errorf("%s: 未找到根元素", c.name)
+				continue
+			}
+			if !strings.Contains(root, `xmlns:r="`+relationshipsNSURI+`"`) {
+				t.Errorf("%s: 根元素应有声明，实际 %s", c.name, root)
+			}
+		}
+		// 幂等：再调一次不应变化
+		if again := ensureWorkbookRelNamespace(got); again != got {
+			t.Errorf("%s: 非幂等，二次调用结果变了", c.name)
+		}
+		// 绝不能把属性插进 xml 声明里
+		if i := strings.Index(got, "<?xml"); i >= 0 {
+			declEnd := strings.Index(got[i:], "?>")
+			if declEnd > 0 && strings.Contains(got[i:i+declEnd], "xmlns:r") {
+				t.Errorf("%s: 属性被插进了 XML 声明：%s", c.name, got[i:i+declEnd])
+			}
+		}
+	}
+}
+
+// TestCopySheetIntoWorkbookWithoutRootDeclEndToEnd 端到端复现用户报告的场景：
+// openpyxl 风格源文件（声明只在各 <sheet> 上）→ CopySheet 造新表 → 删光带声明的原表
+// → 产物必须仍能被 openpyxl 打开。
+func TestCopySheetIntoWorkbookWithoutRootDeclEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.xlsx")
+	// 用 openpyxl 造一个双表工作簿，再把声明从根移到各 <sheet> 上，模拟真实形态
+	writeWorkbookWithSheetLevelRelDecl(t, src, []string{"配置", "月报模板"})
+
+	b, err := Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 前置条件：源文件根上确实没有声明，且带声明的表存在
+	srcWB := readZipPart(t, src, "xl/workbook.xml")
+	if root := workbookRootTag(srcWB); strings.Contains(root, `xmlns:r=`) {
+		t.Fatalf("前置条件不成立：源文件根上已有 xmlns:r，测不到本bug")
+	}
+
+	// 同簿复制出两张新表，随后把带声明的原表删光
+	for _, name := range []string{"2026年1月", "2026年2月"} {
+		if _, err := b.CopySheet("配置", name); err != nil {
+			t.Fatalf("CopySheet: %v", err)
+		}
+	}
+	for _, name := range []string{"配置", "月报模板"} {
+		if err := b.RemoveSheet(name); err != nil {
+			t.Fatalf("RemoveSheet(%s): %v", name, err)
+		}
+	}
+	out := filepath.Join(dir, "out.xlsx")
+	if err := b.SaveAs(out); err != nil {
+		t.Fatal(err)
+	}
+
+	// 产物必须合法：根上有声明，且无声明的 sheet 其r:id 有前缀可依
+	outWB := readZipPart(t, out, "xl/workbook.xml")
+	root := workbookRootTag(outWB)
+	if !strings.Contains(root, `xmlns:r="`+relationshipsNSURI+`"`) {
+		t.Fatalf("产物根元素缺 xmlns:r：\n%s", root)
+	}
+	if strings.Contains(outWB, "月报模板") {
+		t.Errorf("已删表名仍残留在 workbook.xml：\n%s", outWB)
+	}
+
+	// 用 openpyxl 独立校验：这是最能证明"文件没坏"的判据
+	if pythonExe() == "" {
+		t.Skip("未找到 Python/openpyxl，跳过加载校验")
+	}
+	if o, err := runOpenpyxlLoad(t, out); err != nil {
+		t.Fatalf("openpyxl 无法加载产物（文件已损坏）：%v\n%s", err, o)
+	}
+}
+
+// workbookRootTag 提取 workbook.xml 的根元素起始标签（含属性），找不到返回空串。
+func workbookRootTag(wbXML string) string {
+	start := strings.Index(wbXML, "<workbook")
+	if start == -1 {
+		return ""
+	}
+	end := strings.Index(wbXML[start:], ">")
+	if end == -1 {
+		return ""
+	}
+	return wbXML[start : start+end+1]
+}
+
+// writeWorkbookWithSheetLevelRelDecl 造一份openpyxl 风格的工作簿：
+// xmlns:r 声明写在**每个 <sheet> 上**，根元素上没有 —— 这是本bug 的关键前提。
+// 表名用中文以贴近真实场景（表名本身与 bug 无关，只是更易复现真实流程）。
+func writeWorkbookWithSheetLevelRelDecl(t *testing.T, path string, sheetNames []string) {
+	t.Helper()
+	if pythonExe() == "" {
+		t.Skip("未找到 Python/openpyxl")
+	}
+	// 先用 openpyxl 造正常工作簿（它把声明写在 <sheet> 上，根上只有 xmlns）
+	ops := `{"out": ` + quoteJSON(path) + `, "ops": [`
+	for i, n := range sheetNames {
+		if i > 0 {
+			ops += ","
+		}
+		ops += `{"op":"create_sheet","name":` + quoteJSON(n) + `}`
+	}
+	ops += `]}`
+	runOpenpyxlOps(t, path, ops)
+
+	// openpyxl 已经在 <sheet> 上写了声明；为保证前提成立，强制确保根上**没有**声明
+	data := readZipPart(t, path, "xl/workbook.xml")
+	root := workbookRootTag(data)
+	if strings.Contains(root, `xmlns:r=`) {
+		// 去掉根上的声明，保留各 <sheet> 上的
+		stripped := strings.Replace(data, ` xmlns:r="`+relationshipsNSURI+`"`, "", 1)
+		// 只替换第一处（根元素那处），确保它出现在 <workbook ...> 内
+		if r2 := workbookRootTag(stripped); strings.Contains(r2, `xmlns:r=`) {
+			t.Skip("无法构造出「根上无声明」的源文件，跳过本用例")
+		}
+		data = stripped
+	}
+	if err := rewriteZipPart(t, path, "xl/workbook.xml", []byte(data)); err != nil {
+		t.Fatalf("改写 workbook.xml 失败: %v", err)
+	}
+}
+
+// rewriteZipPart 重写 zip 中指定部件的内容（其余部件原样复制）。
+func rewriteZipPart(t *testing.T, path, part string, content []byte) error {
+	t.Helper()
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	for _, f := range zr.File {
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: f.Name, Method: zip.Deflate})
+		if err != nil {
+			return err
+		}
+		if f.Name == part {
+			if _, err := w.Write(content); err != nil {
+				return err
+			}
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(w, rc)
+		rc.Close()
+		if err != nil {
+			return err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o644)
+}
+
+// runOpenpyxlLoad 让 openpyxl 加载指定 xlsx，返回组合输出与错误。
+// 用于验证产物是"真能打开"的，而不只是 XML 看起来对。
+func runOpenpyxlLoad(t *testing.T, xlsx string) (string, error) {
+	t.Helper()
+	py := pythonExe()
+	if py == "" {
+		t.Skip("未找到 Python/openpyxl")
+	}
+	script := filepath.Join(difftestDir(t), "load_check.py")
+	cmd := exec.Command(py, script, xlsx)
+	o, err := cmd.CombinedOutput()
+	return string(o), err
 }

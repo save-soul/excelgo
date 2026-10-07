@@ -330,8 +330,8 @@ func (sw *StreamWriter) writeMetadata() error {
 	// --- xl/workbook.xml ---
 	var wb strings.Builder
 	wb.WriteString(xmlDecl)
-	wb.WriteString(`<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ` +
-		`xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>`)
+	wb.WriteString(`<workbook xmlns="` + spreadsheetMainNS + `" ` +
+		`xmlns:r="` + relationshipsNSURI + `"><sheets>`)
 	for i, s := range sw.sheets {
 		fmt.Fprintf(&wb, `<sheet name="%s" sheetId="%d" r:id="rId%d"/>`,
 			safeAttr(s.name), i+1, i+1)
