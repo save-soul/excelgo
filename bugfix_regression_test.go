@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -3213,4 +3214,190 @@ func extractBlockItemsForTest(xml, block string) []string {
 		return nil
 	}
 	return regexp.MustCompile(`(?s)<xf\b[^>]*/>|<xf\b[^>]*>.*?</xf>`).FindAllString(m[1], -1)
+}
+
+// TestSharedStringsRelationshipRegistered 验证往「原本没有共享字符串表」的已有
+// 工作簿写字符串时，会在 workbook.xml.rels 中登记 sharedStrings 关系。
+//
+// 症状：单元格在 openpyxl 里读得出值，在 Excel/WPS 里整片显示为空。
+// 根因：OOXML 里共享字符串表不是"按部件名约定自动加载"的，它必须由
+// xl/_rels/workbook.xml.rels 中的一条关系显式指向。excelgo 早期只写了
+// xl/sharedStrings.xml 部件并补了 [Content_Types].xml 的 Override，唯独漏了这条
+// 关系，于是部件成为"孤儿"：
+//   - openpyxl 容错高，能按部件名自行推断，读得出值；
+//   - Excel/WPS 严格按关系解析，找不到关系就整片空。
+//
+// 为什么 Create() 路径上看不到这个 bug：blankWorkbookMap 预置的 workbook rels 里
+// 已经含有 sharedStrings 关系（见 book.go），所以只有「Open 一份 Excel/openpyxl
+// 生成的文件再写字符串」这条路径会暴露 —— 而这类文件恰恰是工程上最常见的输入。
+func TestSharedStringsRelationshipRegistered(t *testing.T) {
+	if pythonExe() == "" {
+		t.Skip("未找到 Python/openpyxl")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.xlsx")
+	// openpyxl 生成的最小工作簿：字符串以内联串存储，不含 sharedStrings.xml，
+	// rels 里自然也没有 sharedStrings 关系 —— 正是现实中常见的输入形态。
+	runOpenpyxlOps(t, src, `{"out": `+quoteJSON(src)+
+		`, "ops": [{"op":"set_str","sheet":"Sheet1","cell":"A1","value":"x"}]}`)
+	if partExists(t, src, "xl/sharedStrings.xml") {
+		t.Fatal("前置条件不成立：openpyxl 产物本就含 sharedStrings.xml，测不到本bug")
+	}
+
+	out := filepath.Join(dir, "out.xlsx")
+	b, err := Open(src)
+	if err != nil {
+		t.Fatalf("打开失败: %v", err)
+	}
+	ws, err := b.NewSheet("S")
+	if err != nil {
+		t.Fatalf("新建工作表失败: %v", err)
+	}
+	for _, ref := range []string{"A1", "A4", "B2", "B3", "G7"} {
+		if err := ws.SetCellValue(ref, "val-"+ref); err != nil {
+			t.Fatalf("写%s: %v", ref, err)
+		}
+	}
+	if err := b.SaveAs(out); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+
+	// 1) 部件存在
+	requirePart(t, out, "xl/sharedStrings.xml", "写了字符串就该有共享字符串表")
+	// 2) Content_Types 有 Override
+	if ct := readZipPart(t, out, "[Content_Types].xml"); !strings.Contains(ct, "/xl/sharedStrings.xml") {
+		t.Error("[Content_Types].xml 缺 sharedStrings 的 Override")
+	}
+	// 3) 关键断言：workbook.xml.rels 里有 sharedStrings 关系
+	rels := readZipPart(t, out, "xl/_rels/workbook.xml.rels")
+	if !strings.Contains(rels, sharedStringsRelType) {
+		t.Fatalf("workbook.xml.rels 未登记 sharedStrings 关系，所有 t=\"s\" 单元格在 Excel 里会显示为空：\n%s", rels)
+	}
+	// 关系必须指向真实存在的部件，不能是悬空引用
+	if !relsTargetExists(t, rels, "xl/sharedStrings.xml") {
+		t.Errorf("sharedStrings 关系的 Target 未指向真实部件：\n%s", rels)
+	}
+	// 4) 关系 Id 不得与既有关系冲突
+	assertRIdsUnique(t, rels)
+	// 5) t="s" 单元格确实指向了合法索引（0 <= idx < uniqueCount）
+	assertSharedStringIndicesInRange(t, out)
+}
+
+// TestSharedStringsRelationshipIdempotent 验证重复写字符串不会堆出重复的
+// sharedStrings 关系 —— 同一个 Target 出现两条关系属于非法，Excel 会判损坏。
+func TestSharedStringsRelationshipIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.xlsx")
+	b, err := Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := b.NewSheet("S")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 多轮写入，含重复值（重复值仍只应有一条 sharedStrings 关系）
+	refs := []string{"A1", "B1", "C1", "D1", "E1", "F1", "G1", "H1"}
+	for i, ref := range refs {
+		for _, s := range []string{"alpha", "beta", "alpha"} {
+			if err := ws.SetCellValue(ref, s+"-"+strconv.Itoa(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := b.SaveAs(out); err != nil {
+		t.Fatal(err)
+	}
+	rels := readZipPart(t, out, "xl/_rels/workbook.xml.rels")
+	if n := strings.Count(rels, sharedStringsRelType); n != 1 {
+		t.Fatalf("sharedStrings 关系应恰好 1 条，实得 %d 条：\n%s", n, rels)
+	}
+	assertRIdsUnique(t, rels)
+}
+
+// TestSharedStringsRelNotCreatedWithoutPart 验证部件不存在时不建关系 ——
+// 关系指向缺失部件同样是悬空引用。
+func TestSharedStringsRelNotCreatedWithoutPart(t *testing.T) {
+	fm := map[string][]byte{
+		"xl/_rels/workbook.xml.rels": []byte(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+			`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+			`<Relationship Id="rId1" Type="` + worksheetRelType + `" Target="worksheets/sheet1.xml"/>` +
+			`</Relationships>`),
+	}
+	ensureSharedStringsRel(fm)
+	if strings.Contains(string(fm["xl/_rels/workbook.xml.rels"]), sharedStringsRelType) {
+		t.Error("部件不存在时不应创建 sharedStrings 关系（悬空引用）")
+	}
+	// 部件存在时才建，且只建一条
+	fm["xl/sharedStrings.xml"] = []byte(buildSharedStrings([]string{"a"}))
+	ensureSharedStringsRel(fm)
+	ensureSharedStringsRel(fm)
+	rels := string(fm["xl/_rels/workbook.xml.rels"])
+	if n := strings.Count(rels, sharedStringsRelType); n != 1 {
+		t.Fatalf("部件存在时应恰好 1 条关系，实得 %d 条：\n%s", n, rels)
+	}
+}
+
+// relsTargetExists 检查 rels 中是否存在指向 part 的关系。
+//
+// part 传zip 内的完整部件路径（如 "xl/sharedStrings.xml"），而 rels 里的 Target
+// 是**相对所属部件目录**的写法：workbook.xml.rels 的基准是 xl/，故
+// "sharedStrings.xml" 与 "/xl/sharedStrings.xml" 都指向同一部件
+// （两者都被 Excel 接受），sheet rels 的基准则是 xl/worksheets/。
+// 因此三种等价写法都要认。
+func relsTargetExists(t *testing.T, relsXML, part string) bool {
+	t.Helper()
+	re := regexp.MustCompile(`Target="([^"]*)"`)
+	base := path.Base(part)
+	for _, m := range re.FindAllStringSubmatch(relsXML, -1) {
+		tgt := strings.TrimPrefix(m[1], "/")
+		if tgt == part || tgt == base || tgt == "xl/"+base {
+			return true
+		}
+	}
+	return false
+}
+
+// assertRIdsUnique 断言 rels 中没有重复的 Id。
+func assertRIdsUnique(t *testing.T, relsXML string) {
+	t.Helper()
+	re := regexp.MustCompile(`Id="([^"]*)"`)
+	seen := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(relsXML, -1) {
+		if seen[m[1]] {
+			t.Errorf("workbook.xml.rels 中 Id 重复：%s", m[1])
+		}
+		seen[m[1]] = true
+	}
+}
+
+// assertSharedStringIndicesInRange 断言所有 t="s" 单元格的索引都落在
+// sharedStrings 表的实际条数范围内（越界即悬空，Excel 显示空）。
+func assertSharedStringIndicesInRange(t *testing.T, xlsx string) {
+	t.Helper()
+	ss := readZipPart(t, xlsx, "xl/sharedStrings.xml")
+	n := strings.Count(ss, "<si>")
+	re := regexp.MustCompile(`<c\b[^>]*\bt="s"[^>]*>\s*<v>(\d+)</v>`)
+	z, err := zip.OpenReader(xlsx)
+	if err != nil {
+		t.Fatalf("打开 zip 失败: %v", err)
+	}
+	defer z.Close()
+	for _, f := range z.File {
+		if !strings.HasPrefix(f.Name, "xl/worksheets/") || !strings.HasSuffix(f.Name, ".xml") {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("打开部件失败: %v", err)
+		}
+		body, _ := io.ReadAll(rc)
+		rc.Close()
+		for _, m := range re.FindAllStringSubmatch(string(body), -1) {
+			idx, _ := strconv.Atoi(m[1])
+			if idx < 0 || idx >= n {
+				t.Errorf("%s 中 t=\"s\" 索引 %d 越界（表内共 %d 条）", f.Name, idx, n)
+			}
+		}
+	}
 }

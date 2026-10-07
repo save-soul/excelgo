@@ -232,6 +232,18 @@ func setCellInMap(fileMap map[string][]byte, file, cell string, ct CellType, val
 }
 
 // ensureSharedString 确保 value 存在于 sharedStrings.xml，返回其索引（不存在则追加）。
+//
+// 三处登记缺一不可，缺任何一处都会让 t="s" 的单元格在 Excel/WPS 里显示为空：
+//  1. 部件 xl/sharedStrings.xml 本身；
+//  2. [Content_Types].xml 的 Override；
+//  3. xl/_rels/workbook.xml.rels 里的 sharedStrings 关系。
+//
+// 第3 条最容易被漏掉：Create() 出的空白工作簿其 rels 里预置了 sharedStrings 关系，
+// 所以自建工作簿看不出问题；而 Open() 一份 Excel/openpyxl 生成的文件（这些文件
+// 通常不含共享字符串表，字符串以内联串存储）后再写字符串，部件与 Override 都会被
+// 建出来，却没有关系指向它 —— openpyxl 容错高、能自行按部件名推断，读得出值；
+// Excel/WPS 严格按关系解析，找不到关系就整片显示为空。这个 bug 极其隐蔽：
+// 不报任何错、openpyxl 校验也通过，只有真Excel 才暴露。
 func ensureSharedString(fileMap map[string][]byte, value string) (int, error) {
 	const ssPath = "xl/sharedStrings.xml"
 	// 读取或初始化
@@ -257,7 +269,59 @@ func ensureSharedString(fileMap map[string][]byte, value string) (int, error) {
 		"/xl/sharedStrings.xml",
 		"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
 	)
+	// 确保 workbook.xml.rels 有 sharedStrings 关系（幂等，见 ensureSharedStringsRel）
+	ensureSharedStringsRel(fileMap)
 	return count, nil
+}
+
+// sharedStringsRelType 是共享字符串表的关系类型。
+// worksheet 关系类型见 ops.go 的 worksheetRelType。
+const sharedStringsRelType = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings"
+
+// ensureSharedStringsRel 在 xl/_rels/workbook.xml.rels 中登记 sharedStrings 关系。
+//
+// 幂等：已存在指向 sharedStrings.xml 的关系时原样返回，因此每次追加字符串都可安全调用。
+// 缺少该部件（如从未写过字符串的工作簿）时不登记 —— 无部件的关系同样是悬空引用。
+func ensureSharedStringsRel(fileMap map[string][]byte) {
+	const relsPath = "xl/_rels/workbook.xml.rels"
+	const ssPath = "xl/sharedStrings.xml"
+	// 无部件则不建关系：OOXML 中关系指向不存在的部件属于悬空引用。
+	if _, ok := fileMap[ssPath]; !ok {
+		return
+	}
+	relsData, ok := fileMap[relsPath]
+	if !ok {
+		// 无 workbook rels 的工作簿不是合法的 xlsx，正常不会走到；真遇到了也不凭空造，
+		// 交由上层保存时的完整性检查报错，避免掩盖更大的问题。
+		return
+	}
+	if relsHasSharedStrings(relsData) {
+		return
+	}
+	rels := &Relationships{}
+	if err := getXMLFromMap(fileMap, relsPath, rels); err != nil {
+		return
+	}
+	newRId := fmt.Sprintf("rId%d", getMaxRId(rels)+1)
+	fileMap[relsPath] = insertRelationshipInRels(
+		relsData, newRId, sharedStringsRelType, "sharedStrings.xml",
+	)
+}
+
+// relsHasSharedStrings 判断 workbook.xml.rels 中是否已有 sharedStrings 关系。
+// 依据关系类型判断而非只比Target：不同生成器写出的 Target 形式不同
+// （"sharedStrings.xml" 与 "/xl/sharedStrings.xml" 都合法），只看 Target 会漏判。
+func relsHasSharedStrings(relsData []byte) bool {
+	rels := &Relationships{}
+	if err := parseXML(relsData, rels); err != nil {
+		return false
+	}
+	for _, r := range rels.Relationship {
+		if r.Type == sharedStringsRelType {
+			return true
+		}
+	}
+	return false
 }
 
 // extractSharedStrings 从 sharedStrings.xml 提取所有 <t> 文本（顺序即索引）。
