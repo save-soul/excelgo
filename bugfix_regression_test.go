@@ -3766,3 +3766,102 @@ func runOpenpyxlLoad(t *testing.T, xlsx string) (string, error) {
 	o, err := cmd.CombinedOutput()
 	return string(o), err
 }
+
+// TestReplaceSheetNameInRange 覆盖引用范围里的表名替换。
+//
+// 两个曾经出错的地方：
+//  1. **引号**：Excel/openpyxl 写出的表名带单引号（'Sheet'!$A$1），而库自造数据
+//     不带引号（Sheet!$A$1）。旧实现拿未加引号的 srcName 做前缀匹配，真实数据
+//     直接匹配不上 —— 连单段都不替换。两种写法都必须认。
+//  2. **多段**：Excel 的引用范围是逗号分隔的多段。同时设置「重复打印行 + 重复打印列」
+//     时 Print_Titles 就是两段：'月报模板'!$1:$6,'月报模板'!$A:$B。
+//     旧实现用 strings.HasPrefix 只处理第一段，后半截原样保留 → 悬空引用。
+func TestReplaceSheetNameInRange(t *testing.T) {
+	cases := []struct {
+		name          string
+		rng, src, dst string
+		want          string
+	}{
+		{"带引号单段", "'月报模板'!$1:$6", "月报模板", "副本", "'副本'!$1:$6"},
+		{"带引号单段-打印区域", "'月报模板'!$A$1:$H$30", "月报模板", "副本", "'副本'!$A$1:$H$30"},
+		{"无引号单段", "月报模板!$1:$6", "月报模板", "副本", "副本!$1:$6"},
+		{"带引号多段-行标题在前", "'月报模板'!$1:$6,'月报模板'!$A:$B", "月报模板", "副本", "'副本'!$1:$6,'副本'!$A:$B"},
+		{"带引号多段-列标题在前", "'月报模板'!$A:$B,'月报模板'!$1:$6", "月报模板", "副本", "'副本'!$A:$B,'副本'!$1:$6"},
+		{"三段全换", "'T'!$1:$1,'T'!$A:$A,'T'!$A$1:$B$2", "T", "新", "'新'!$1:$1,'新'!$A:$A,'新'!$A$1:$B$2"},
+		{"多段混合引号", "'T'!$1:$1,T!$A:$A", "T", "新", "'新'!$1:$1,新!$A:$A"},
+		{"不匹配其他表-原样", "'其他表'!$1:$6", "月报模板", "副本", "'其他表'!$1:$6"},
+		{"前缀相同不误伤", "'月报模板X'!$1:$6", "月报模板", "副本", "'月报模板X'!$1:$6"},
+		{"前缀相同无引号不误伤", "月报模板X!$1:$6", "月报模板", "副本", "月报模板X!$1:$6"},
+		{"普通单元格引用不受影响", "Sheet1!A1:A9", "月报模板", "副本", "Sheet1!A1:A9"},
+		{"多段只换匹配的段", "'其他'!$1:$1,'月报模板'!$2:$2", "月报模板", "副本", "'其他'!$1:$1,'副本'!$2:$2"},
+	}
+	for _, c := range cases {
+		if got := replaceSheetNameInRange(c.rng, c.src, c.dst); got != c.want {
+			t.Errorf("%s: replaceSheetNameInRange(%q, %q, %q)\n  got  %q\n  want %q",
+				c.name, c.rng, c.src, c.dst, got, c.want)
+		}
+	}
+}
+
+// TestRenameSheetUpdatesDefinedNames 验证改名时同步更新 definedName 里的表引用。
+//
+// 漏掉这步的后果：<sheet name> 已改，但 Print_Area / Print_Titles 的 refersTo
+// 仍指向旧表名 —— 悬空引用。Excel 打开提示修复，修复后**静默丢弃**打印设置。
+func TestRenameSheetUpdatesDefinedNames(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "book.xlsx")
+	b, err := Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := b.NewSheet("月报模板")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws.SetCellValue("A1", "x")
+	if err := b.SaveAs(f); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetSheetProps(f, "月报模板", SheetProps{
+		PrintTitleRows: "1:6", PrintArea: "A1:H30"}); err != nil {
+		t.Fatal(err)
+	}
+	// 再加一条**带引号的多段** Print_Titles（Excel 同时设行列标题时的产物）
+	injectQuotedMultiSegTitles(t, f, "月报模板", "_xlnm.Print_Titles_行列")
+
+	if err := RenameSheet(f, "月报模板", "2026年1月"); err != nil {
+		t.Fatalf("RenameSheet: %v", err)
+	}
+	wbXML := readZipPart(t, f, "xl/workbook.xml")
+	if !strings.Contains(wbXML, `name="2026年1月"`) {
+		t.Fatalf("sheet 改名未生效：\n%s", wbXML)
+	}
+	// 任何残留的旧表名都是悬空引用
+	if strings.Contains(wbXML, "月报模板") {
+		t.Errorf("改名后 definedName 仍引用旧表名：\n%s", wbXML)
+	}
+	// 打印设置确实搬到了新表名下
+	if !strings.Contains(wbXML, "2026年1月!$A$1:$H$30") {
+		t.Errorf("打印区域未跟随改名：\n%s", wbXML)
+	}
+	// 多段的那条也要全段换掉
+	if !strings.Contains(wbXML, "'2026年1月'!$1:$6,'2026年1月'!$A:$B") {
+		t.Errorf("多段 Print_Titles 未完整改写：\n%s", wbXML)
+	}
+}
+
+// injectQuotedMultiSegTitles 往 workbook.xml 注入一条带引号的多段 definedName，
+// 用于构造"Excel 真实产物"形态的数据（库自造数据是无引号单段，覆盖不到）。
+func injectQuotedMultiSegTitles(t *testing.T, f, sheet, name string) {
+	t.Helper()
+	data := readZipPart(t, f, "xl/workbook.xml")
+	tag := "<definedName name=\"" + name + "\" localSheetId=\"0\">'" + sheet +
+		"'!$1:$6,'" + sheet + "'!$A:$B</definedName>"
+	updated := strings.Replace(string(data), "</definedNames>", tag+"</definedNames>", 1)
+	if updated == string(data) {
+		t.Fatalf("未能注入 definedName：\n%s", data)
+	}
+	if err := rewriteZipPart(t, f, "xl/workbook.xml", []byte(updated)); err != nil {
+		t.Fatalf("改写 workbook.xml 失败: %v", err)
+	}
+}

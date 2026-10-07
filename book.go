@@ -145,6 +145,9 @@ func (b *Book) RenameSheet(oldName, newName string) error {
 	if bytes.Equal(before, after) {
 		return fmt.Errorf("工作表 %q 不存在，无法重命名", oldName)
 	}
+	// 同步改掉 definedName 里对该表的引用（打印区域/重复打印标题等）。
+	// 漏掉这步会让改完名后 definedName 悬空指向旧表名，Excel 修复时静默丢弃打印设置。
+	after = renameDefinedNamesInWorkbookXML(after, oldName, newName)
 	b.fileMap["xl/workbook.xml"] = after
 	return nil
 }

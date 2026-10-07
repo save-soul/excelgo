@@ -418,7 +418,12 @@ func RenameSheet(filename, oldName, newName string) error {
 	if err := validateSheetName(finalNew); err != nil {
 		return err
 	}
-	fileMap["xl/workbook.xml"] = renameSheetInWorkbookXML(fileMap["xl/workbook.xml"], oldName, finalNew)
+	// 同步改 definedName 里的表引用（打印区域/重复打印标题），
+	// 否则重命名后这些引用悬空指向旧表名，Excel 修复时会静默丢弃打印设置。
+	wbData := renameDefinedNamesInWorkbookXML(
+		renameSheetInWorkbookXML(fileMap["xl/workbook.xml"], oldName, finalNew),
+		oldName, finalNew)
+	fileMap["xl/workbook.xml"] = wbData
 	if err := writeMapToZip(filename, fileMap); err != nil {
 		return err
 	}
@@ -565,6 +570,27 @@ func renameSheetInWorkbookXML(wbXML []byte, oldName, newName string) []byte {
 	content := string(wbXML)
 	re := regexp.MustCompile(`(<sheet\b[^>]*\bname=")(` + regexp.QuoteMeta(safeAttr(oldName)) + `)(")`)
 	return []byte(re.ReplaceAllString(content, `${1}`+safeAttr(newName)+`${3}`))
+}
+
+// renameDefinedNamesInWorkbookXML 同步重命名 definedName 里对 oldName 的表引用。
+//
+// 为什么必须做：definedName 的 refersTo 用**表名**引用工作表（如
+// _xlnm.Print_Area = '月报模板'!$A$1:$H$30）。只改 <sheet name> 而不动它，
+// 改完表名后该引用就成了悬空指向 —— Excel 打开时提示修复，修复后**静默丢弃**
+// 打印区域与重复打印标题。这类损坏不报错、openpyxl 也能读，极难排查。
+//
+// 逐个 definedName 替换其内容，复用 replaceSheetNameInRange —— 它按逗号分段
+// 精确匹配，能正确处理 Print_Titles 的多段写法，且不会误伤前缀相同的其他表名。
+func renameDefinedNamesInWorkbookXML(wbXML []byte, oldName, newName string) []byte {
+	content := string(wbXML)
+	re := regexp.MustCompile(`(?s)(<definedName\b[^>]*>)([^<]*)(</definedName>)`)
+	return []byte(re.ReplaceAllStringFunc(content, func(m string) string {
+		sub := re.FindStringSubmatch(m)
+		if sub == nil {
+			return m
+		}
+		return sub[1] + replaceSheetNameInRange(sub[2], oldName, newName) + sub[3]
+	}))
 }
 
 // ---------- sheet 标签提取/重建 ----------

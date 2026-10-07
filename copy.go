@@ -661,18 +661,43 @@ func duplicatePrintArea(wbXML []byte, srcIndex, newIndex int, srcName, newName s
 	return []byte(content)
 }
 
-// 将引用范围（如 "Sheet1!$A$1:$J$37"）中的工作表名替换为新名。
-// 仅当范围以 srcName 开头并紧跟 ! 时才替换，避免误伤普通单元格引用。
-// replaceSheetNameInRange 把引用范围中的工作表名替换为新名。
-// 注意：srcName/newName 传入的是「原始（未转义）」表名；而 rng 来自 workbook.xml 字节，
+// replaceSheetNameInRange 把引用范围中的工作表名由 srcName 换成 newName。
+//
+// 关键点一：Excel 的引用范围是**逗号分隔的多段**，每段各自带表名。
+// 同时设置「重复打印行 + 重复打印列」时 Excel 自己就会写出多段：
+//
+//	_xlnm.Print_Titles = '月报模板'!$1:$6,'月报模板'!$A:$B
+//	                     ↑ 行标题                ↑ 列标题 —— 两段都是独立引用
+//
+// 早期实现用 strings.HasPrefix 只处理**第一段**，多段的后半截原样保留，于是复制/
+// 改名后留下悬空引用（'月报模板' 那张表已不存在或已是旧名）。故改为逐段处理。
+//
+// 关键点二：表名在范围里是**带单引号**的（Excel 对含空格/中文的表名必加引号，
+// openpyxl 同样如此）。旧实现拿未加引号的 srcName 做前缀匹配，带引号的真实数据
+// 直接匹配不上 —— 结果连单段都没换。故带引号与不带引号两种写法都要认。
+//
+// 匹配严格按**段边界**：只处理以 srcName（或 'srcName'）紧跟 '!' 开头的段，
+// 表名为另一名字前缀时（src=月报模板、引用的是 月报模板X）不会被误伤。
+//
+// srcName/newName 传入的是「原始（未转义）」表名；rng 来自 workbook.xml 字节，
 // 其中的表名是 XML 转义后的形式。表名含 & < > " 时两者不等价，因此匹配与替换
 // 都在转义后的空间进行，避免双重转义或替换失败。
 func replaceSheetNameInRange(rng, srcName, newName string) string {
-	prefix := safeText(srcName) + "!"
-	if strings.HasPrefix(rng, prefix) {
-		return safeText(newName) + "!" + rng[len(prefix):]
+	escSrc, escDst := safeText(srcName), safeText(newName)
+	segments := strings.Split(rng, ",")
+	for i, seg := range segments {
+		trimmed := strings.TrimSpace(seg)
+		// 带引号写法：'表名'!
+		if q := "'" + escSrc + "'!"; strings.HasPrefix(trimmed, q) {
+			segments[i] = "'" + escDst + "'!" + trimmed[len(q):]
+			continue
+		}
+		// 无引号写法：表名!
+		if p := escSrc + "!"; strings.HasPrefix(trimmed, p) {
+			segments[i] = escDst + "!" + trimmed[len(p):]
+		}
 	}
-	return rng
+	return strings.Join(segments, ",")
 }
 
 // ---------- 路径处理 ----------
