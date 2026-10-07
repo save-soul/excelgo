@@ -6,6 +6,7 @@
 
 # 测试 / 临时产物
 *.test
+*.log
 out_*.xlsx
 output_*.xlsx
 _*.xlsx
@@ -21,6 +22,12 @@ _probe/
 
 # 项目内部数据（memory / 缓存，不进版本库）
 .workbuddy/
+
+# generated/ 是 all_features_test.go 的**输出**目录：每次 go test 都会被整体重写，
+# 而 xlsx 是 zip 容器、内部条目顺序与时间戳不稳定，内容几乎必然与上次不同，
+# 于是每次跑测试都产生一批无意义的二进制改动，淹没真实 diff。
+# 该目录不被任何测试当作输入（那几处都是 cpFile 往外拷），故取消跟踪。
+generated/
 
 # difftest/ 下的 .xlsx 全部是 openpyxl 探针脚本的产物（base.xlsx / prn.xlsx /
 # charts.xlsx / probe_combos*.xlsx 等），由 difftest/*.py 按默认参数就地生成。
