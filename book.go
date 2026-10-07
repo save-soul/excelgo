@@ -27,6 +27,18 @@ import (
 type Book struct {
 	filename string
 	fileMap  map[string][]byte
+	// sstCache 是 sharedStrings.xml 的解析索引缓存，仅作写入加速。
+	// 以部件字节为指纹，外部改动该部件会自动使其失效，故不影响正确性。
+	// 生命周期与本 Book 一致（打开的文件已含 SST 时才会在首次写入时填充）。
+	sstCache *sharedStringsCache
+}
+
+// sst 返回本工作簿的共享字符串缓存（惰性创建）。
+func (b *Book) sst() *sharedStringsCache {
+	if b.sstCache == nil {
+		b.sstCache = &sharedStringsCache{}
+	}
+	return b.sstCache
 }
 
 // File 即 Book 的别名，与 excelize 的 *File 命名保持一致，便于从 excelize 迁移。
@@ -604,22 +616,22 @@ func (s *WorkSheet) rowsUsed() int {
 
 // SetCellStr 写入共享字符串。
 func (s *WorkSheet) SetCellStr(ref, val string) error {
-	return setCellInMap(s.fm(), s.file, ref, CellTypeString, val, "")
+	return setCellInMap(s.fm(), s.file, ref, CellTypeString, val, "", s.book.sst())
 }
 
 // SetCellInline 写入内联字符串。
 func (s *WorkSheet) SetCellInline(ref, val string) error {
-	return setCellInMap(s.fm(), s.file, ref, CellTypeInline, val, "")
+	return setCellInMap(s.fm(), s.file, ref, CellTypeInline, val, "", s.book.sst())
 }
 
 // SetCellInt 写入整数数值。
 func (s *WorkSheet) SetCellInt(ref string, val int) error {
-	return setCellInMap(s.fm(), s.file, ref, CellTypeNumeric, strconv.Itoa(val), "")
+	return setCellInMap(s.fm(), s.file, ref, CellTypeNumeric, strconv.Itoa(val), "", s.book.sst())
 }
 
 // SetCellNumeric 写入浮点数值。
 func (s *WorkSheet) SetCellNumeric(ref string, val float64) error {
-	return setCellInMap(s.fm(), s.file, ref, CellTypeNumeric, strconv.FormatFloat(val, 'f', -1, 64), "")
+	return setCellInMap(s.fm(), s.file, ref, CellTypeNumeric, strconv.FormatFloat(val, 'f', -1, 64), "", s.book.sst())
 }
 
 // SetCellBool 写入布尔值。
@@ -628,12 +640,12 @@ func (s *WorkSheet) SetCellBool(ref string, val bool) error {
 	if val {
 		b = "1"
 	}
-	return setCellInMap(s.fm(), s.file, ref, CellTypeBool, b, "")
+	return setCellInMap(s.fm(), s.file, ref, CellTypeBool, b, "", s.book.sst())
 }
 
 // SetCellFormula 写入公式（可选 result 作为预计算缓存值）。
 func (s *WorkSheet) SetCellFormula(ref, formula, result string) error {
-	return setCellInMap(s.fm(), s.file, ref, CellTypeFormula, formula, result)
+	return setCellInMap(s.fm(), s.file, ref, CellTypeFormula, formula, result, s.book.sst())
 }
 
 // GetRange 读取矩形区域的值（二维 [][]string）。
@@ -647,7 +659,7 @@ func (s *WorkSheet) GetRange(ref string) ([][]string, error) {
 
 // SetRange 把二维值写入矩形区域（左上角对齐，单格起点自动扩展）。
 func (s *WorkSheet) SetRange(ref string, values [][]interface{}) error {
-	return setRangeInMap(s.fm(), s.file, ref, values)
+	return setRangeInMap(s.fm(), s.file, ref, values, s.book.sst())
 }
 
 // SetStyle 把样式应用到单个单元格，返回 s 索引。

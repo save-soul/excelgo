@@ -89,14 +89,15 @@ func SetRange(filename, sheetRef, rangeRef string, values [][]interface{}) error
 	if err != nil {
 		return err
 	}
-	if err := setRangeInMap(fileMap, file, rangeRef, values); err != nil {
+	sc := &sharedStringsCache{}
+	if err := setRangeInMap(fileMap, file, rangeRef, values, sc); err != nil {
 		return err
 	}
 	return writeMapToZip(filename, fileMap)
 }
 
 // setRangeInMap 在内存 fileMap 上把 values 写入 file 工作表的 rangeRef（不复写磁盘）。
-func setRangeInMap(fileMap map[string][]byte, file, rangeRef string, values [][]interface{}) error {
+func setRangeInMap(fileMap map[string][]byte, file, rangeRef string, values [][]interface{}, sc *sharedStringsCache) error {
 	if len(values) == 0 {
 		return nil
 	}
@@ -136,7 +137,7 @@ func setRangeInMap(fileMap map[string][]byte, file, rangeRef string, values [][]
 				continue
 			}
 			cell := colNumToLetters(c1+j) + strconv.Itoa(r1+i+1)
-			if err := writeRangeCell(fileMap, file, cell, val); err != nil {
+			if err := writeRangeCell(fileMap, file, cell, val, sc); err != nil {
 				return err
 			}
 		}
@@ -145,26 +146,26 @@ func setRangeInMap(fileMap map[string][]byte, file, rangeRef string, values [][]
 }
 
 // writeRangeCell 把单个值（按类型分派）写入 fileMap 中的 worksheet。
-func writeRangeCell(fileMap map[string][]byte, file, cell string, val interface{}) error {
+func writeRangeCell(fileMap map[string][]byte, file, cell string, val interface{}, sc *sharedStringsCache) error {
 	switch v := val.(type) {
 	case string:
-		return setCellInMap(fileMap, file, cell, CellTypeString, v, "")
+		return setCellInMap(fileMap, file, cell, CellTypeString, v, "", sc)
 	case int:
-		return setCellInMap(fileMap, file, cell, CellTypeNumeric, strconv.Itoa(v), "")
+		return setCellInMap(fileMap, file, cell, CellTypeNumeric, strconv.Itoa(v), "", sc)
 	case int64:
-		return setCellInMap(fileMap, file, cell, CellTypeNumeric, strconv.FormatInt(v, 10), "")
+		return setCellInMap(fileMap, file, cell, CellTypeNumeric, strconv.FormatInt(v, 10), "", sc)
 	case float64:
-		return setCellInMap(fileMap, file, cell, CellTypeNumeric, strconv.FormatFloat(v, 'f', -1, 64), "")
+		return setCellInMap(fileMap, file, cell, CellTypeNumeric, strconv.FormatFloat(v, 'f', -1, 64), "", sc)
 	case float32:
-		return setCellInMap(fileMap, file, cell, CellTypeNumeric, strconv.FormatFloat(float64(v), 'f', -1, 64), "")
+		return setCellInMap(fileMap, file, cell, CellTypeNumeric, strconv.FormatFloat(float64(v), 'f', -1, 64), "", sc)
 	case bool:
 		b := "0"
 		if v {
 			b = "1"
 		}
-		return setCellInMap(fileMap, file, cell, CellTypeBool, b, "")
+		return setCellInMap(fileMap, file, cell, CellTypeBool, b, "", sc)
 	case CellFormula:
-		return setCellInMap(fileMap, file, cell, CellTypeFormula, v.Formula, v.Result)
+		return setCellInMap(fileMap, file, cell, CellTypeFormula, v.Formula, v.Result, sc)
 	default:
 		return fmt.Errorf("SetRange 不支持的值类型: %T", val)
 	}

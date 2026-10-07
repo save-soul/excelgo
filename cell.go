@@ -13,6 +13,7 @@ package excelgo
 // 子元素：<f>公式</f> <v>值</v> <is><t>内联字符串</t></is>
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"regexp"
@@ -177,6 +178,8 @@ func SetCellFormula(filename, sheetRef, cell, formula, result string) error {
 // ---------- 内部实现 ----------
 
 // writeCell 是统一的单元格写入入口（按文件读写）。
+// 每次调用只写一个格子即落盘，共享字符串缓存无跨调用收益，但仍传一个空缓存：
+// 语义上让"部件此前不存在"时不误建缓存（见 ensureSharedString 末尾注释）。
 func writeCell(filename, sheetRef, cell string, ct CellType, value, result string) error {
 	fileMap, err := readZipToMap(filename)
 	if err != nil {
@@ -190,7 +193,8 @@ func writeCell(filename, sheetRef, cell string, ct CellType, value, result strin
 	if err != nil {
 		return err
 	}
-	if err := setCellInMap(fileMap, file, cell, ct, value, result); err != nil {
+	sc := &sharedStringsCache{}
+	if err := setCellInMap(fileMap, file, cell, ct, value, result, sc); err != nil {
 		return err
 	}
 	return writeMapToZip(filename, fileMap)
@@ -199,7 +203,7 @@ func writeCell(filename, sheetRef, cell string, ct CellType, value, result strin
 // setCellInMap 在已读入内存的 fileMap 上写入单个单元格（不读写磁盘）。
 // 供 writeCell 与区域批量写入 SetRange 复用，避免每个单元格重复读盘。
 // file 为 worksheet XML 在 fileMap 中的路径；ct/value/result 语义同 writeCell。
-func setCellInMap(fileMap map[string][]byte, file, cell string, ct CellType, value, result string) error {
+func setCellInMap(fileMap map[string][]byte, file, cell string, ct CellType, value, result string, sc *sharedStringsCache) error {
 	ws := string(fileMap[file])
 
 	// 共享字符串：转为索引
@@ -207,7 +211,7 @@ func setCellInMap(fileMap map[string][]byte, file, cell string, ct CellType, val
 	var tAttr xmlFrag
 	switch ct {
 	case CellTypeString:
-		idx, err := ensureSharedString(fileMap, value)
+		idx, err := ensureSharedString(fileMap, value, sc)
 		if err != nil {
 			return err
 		}
@@ -244,22 +248,44 @@ func setCellInMap(fileMap map[string][]byte, file, cell string, ct CellType, val
 // 建出来，却没有关系指向它 —— openpyxl 容错高、能自行按部件名推断，读得出值；
 // Excel/WPS 严格按关系解析，找不到关系就整片显示为空。这个 bug 极其隐蔽：
 // 不报任何错、openpyxl 校验也通过，只有真Excel 才暴露。
-func ensureSharedString(fileMap map[string][]byte, value string) (int, error) {
+func ensureSharedString(fileMap map[string][]byte, value string, sc *sharedStringsCache) (int, error) {
 	const ssPath = "xl/sharedStrings.xml"
-	// 读取或初始化
+	data := fileMap[ssPath]
+
+	// 快速路径：缓存已建立过索引、且指纹与当前部件字节一致 → 直接查表定址。
+	// data != nil 是必要条件：部件尚未存在时 src 与 data 同为 nil，bytes.Equal(nil,nil)
+	// 为 true，会让未初始化的空缓存误入此路径并在写 index 时 panic。
+	if sc != nil && sc.index != nil && data != nil && bytes.Equal(sc.src, data) {
+		if idx, ok := sc.index[value]; ok {
+			return idx, nil
+		}
+		newIdx := len(sc.items)
+		sc.items = append(sc.items, value)
+		sc.index[value] = newIdx
+		fileMap[ssPath] = appendSharedStringItem(data, value)
+		sc.src = fileMap[ssPath]
+		return newIdx, nil
+	}
+
+	// 慢路径（首次调用或缓存失效）：全量解析一次并重建索引表。
 	var items []string
-	count := 0
-	if data, ok := fileMap[ssPath]; ok {
+	if data != nil {
 		items = extractSharedStrings(string(data))
-		count = len(items)
 	}
 	// 去重：已存在则复用索引
 	for i, s := range items {
 		if s == value {
+			// 命中已有项：不追加，但仍固化缓存（否则重复写同一串永远走慢路径）
+			if sc != nil {
+				sc.src = data
+				sc.items = items
+				sc.index = buildSSTIndex(items)
+			}
 			return i, nil
 		}
 	}
 	// 追加
+	newIdx := len(items)
 	items = append(items, value)
 	// 重建 sharedStrings.xml
 	fileMap[ssPath] = []byte(buildSharedStrings(items))
@@ -271,7 +297,76 @@ func ensureSharedString(fileMap map[string][]byte, value string) (int, error) {
 	)
 	// 确保 workbook.xml.rels 有 sharedStrings 关系（幂等，见 ensureSharedStringsRel）
 	ensureSharedStringsRel(fileMap)
-	return count, nil
+	// 建缓存：部件此刻已存在，把指纹与索引一并固化，下次即可走快速路径。
+	// 命中已有项时（found >= 0）items 未增长，仍需建缓存 —— 否则重复写同一字符串
+	// 会永远落在慢路径上，缓存等于白建。
+	if sc != nil {
+		sc.src = fileMap[ssPath]
+		sc.items = items
+		sc.index = buildSSTIndex(items)
+	}
+	return newIdx, nil
+}
+
+func buildSSTIndex(items []string) map[string]int {
+	idx := make(map[string]int, len(items))
+	for i, s := range items {
+		if _, dup := idx[s]; !dup {
+			idx[s] = i
+		}
+	}
+	return idx
+}
+
+// ---------- 共享字符串表索引缓存 ----------
+//
+// 原实现每写一个字符串都要「全量解析 SST → 线性扫描去重 → 全量重建部件」，
+// n 个字符串的总代价是 O(n²·L)。实测 2000 格耗时 23.5 秒，写大表不可用。
+//
+// 优化：把「已有项的 value→索引」建成 map，查表定址 O(1)；追加时只在 </sst> 前
+// 插入一个 <si>，不再重建整个部件。追加本身仍是 O(L) 的字符串拼接（无法回避），
+// 但去重扫描与部件重建两处开销被消除，总体降到 O(n·L)。
+//
+// 正确性保障：缓存持有它所依赖的**部件原始字节**作为指纹。任何对该部件的外部
+// 改动（CopySheet / 合并 / 直接改 fileMap）都会使指纹失配，缓存自动丢弃并回退到
+// 全量重解析 —— 缓存只影响速度，不影响正确性。
+
+// sharedStringsCache 缓存某工作簿 sharedStrings.xml 的解析结果与索引。
+type sharedStringsCache struct {
+	src   []byte         // 建立/更新时的部件字节（指纹）
+	items []string       // 全部 <si> 文本，顺序即索引
+	index map[string]int // value → 索引，去重查表
+}
+
+// appendSharedStringItem 在已有 sharedStrings.xml 的 </sst> 前插入一个 <si>，
+// 并同步递增 count/uniqueCount。部件不存在或结构异常时回退到整体重建。
+func appendSharedStringItem(data []byte, value string) []byte {
+	s := string(data)
+	end := strings.LastIndex(s, "</sst>")
+	if end < 0 {
+		// 无闭合标签（部件不存在或损坏）：退化为单元素重建。
+		return []byte(buildSharedStrings([]string{value}))
+	}
+	item := `<si><t xml:space="preserve">` + safeText(value) + `</t></si>`
+	var b strings.Builder
+	b.Grow(len(s) + len(item) + 32)
+	b.WriteString(s[:end])
+	b.WriteString(item)
+	b.WriteString(s[end:])
+	// count/uniqueCount 是「引用总数 / 去重后条目数」，两者同步 +1（Excel 按提示值校验）
+	return []byte(bumpSSTCounts(b.String()))
+}
+
+// bumpSSTCounts 把 <sst ... count="N" uniqueCount="M"> 的两个计数各加一。
+var sstCountAttrRe = regexp.MustCompile(`(<sst\b[^>]*?\bcount=")(\d+)("\s+uniqueCount=")(\d+)(")`)
+
+func bumpSSTCounts(s string) string {
+	return sstCountAttrRe.ReplaceAllStringFunc(s, func(m string) string {
+		g := sstCountAttrRe.FindStringSubmatch(m)
+		c1, _ := strconv.Atoi(g[2])
+		u1, _ := strconv.Atoi(g[4])
+		return g[1] + strconv.Itoa(c1+1) + g[3] + strconv.Itoa(u1+1) + g[5]
+	})
 }
 
 // sharedStringsRelType 是共享字符串表的关系类型。

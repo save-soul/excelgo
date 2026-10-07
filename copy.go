@@ -331,6 +331,11 @@ func copySheetAcrossMaps(srcMap, dstMap map[string][]byte, sheetRef, newName str
 	if sst, ok := srcMap["xl/sharedStrings.xml"]; ok {
 		newWS = convertSharedStringsToInline(newWS, string(sst))
 	}
+	// 4c. 清除复制体的 tabSelected，避免与源表构成「成组工作表」
+	// （源表为活动表时该标记随 XML 逐字节搬运，编辑副本会连带改写正本）。
+	if strings.Contains(newWS, `tabSelected="1"`) {
+		newWS = strings.ReplaceAll(newWS, ` tabSelected="1"`, "")
+	}
 	// 5. 搬移关联部件（drawing / media / 批注 / 图表 / 超链接等）并重映射 rId。
 	// 该函数会重写工作表里的 rId 引用并**返回**新内容 —— 必须在所有改写
 	// （s 索引、dxfId、共享字符串）完成后一次性写回，避免中途覆盖。
@@ -986,6 +991,13 @@ func copyWorksheetWithRelationships(fileMap map[string][]byte, srcSheetFile stri
 	// 否则 Excel/WPS 打开会报 "unbound prefix"。
 	if strings.Contains(newWS, "x14:picture") || strings.Contains(newWS, "AlternateContent") {
 		newWS = ensureWorksheetNamespaces(newWS)
+	}
+
+	// 2e. 清除复制体的 tabSelected —— 源表若是活动表，该标记会被逐字节带过来，
+	// 与源表一起构成「成组工作表」，导致编辑副本连带改写正本。
+	// activeTab 不动，打开文件时仍定位到原活动表。
+	if strings.Contains(newWS, `tabSelected="1"`) {
+		newWS = strings.ReplaceAll(newWS, ` tabSelected="1"`, "")
 	}
 
 	// 回写改写后的工作表 XML

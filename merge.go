@@ -220,6 +220,11 @@ func mergeOneSheet(dstMap map[string][]byte, dstWB *Workbook, dstWBrels *Relatio
 	if sst, ok := srcMap["xl/sharedStrings.xml"]; ok {
 		newWS = convertSharedStringsToInline(newWS, string(sst))
 	}
+	// 5.6 清除合并进来的 tabSelected —— 源表若为活动表，该标记会随 XML 逐字节搬运，
+	// 与目标簿已有的选中表构成「成组工作表」，编辑新表连带改写目标簿原有表。
+	if strings.Contains(newWS, `tabSelected="1"`) {
+		newWS = strings.ReplaceAll(newWS, ` tabSelected="1"`, "")
+	}
 
 	// 6. 复制源工作表的关联部件（drawing/media/comments/charts 等）到目标编号空间
 	//    复用 copy.go 的 handleTarget 思路，但源在 srcMap、目标在 dstMap。
